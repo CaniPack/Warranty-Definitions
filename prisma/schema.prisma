@@ -1,0 +1,95 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
+// enough when changing adapters.
+// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+}
+
+// Defines the template or blueprint for a warranty
+model WarrantyDefinition {
+  id             Int      @id @default(autoincrement())
+  name           String   // e.g., "12-Month Electronics Warranty"
+  durationMonths Int      // e.g., 12, 24, 36
+  priceType      String   // "PERCENTAGE" or "FIXED"
+  priceValue     Float    // The percentage (e.g., 10.0) or fixed amount (e.g., 29.99)
+  description    String?  // Optional description shown to admin/customer
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // Relation to associations
+  productAssociations ProductAssociation[]
+}
+
+// Represents the actual product variant created in Shopify for a specific warranty offer
+model WarrantyProduct {
+  id                  Int      @id @default(autoincrement())
+  shopifyProductId    String   // Shopify Product GID (gid://shopify/Product/...) - Could be one central product for all warranties
+  shopifyVariantId    String   @unique // Shopify Variant GID (gid://shopify/ProductVariant/...) - This is what's added to cart
+  calculatedPrice     Float    // The specific price for this variant
+  durationMonths      Int      // The specific duration for this variant
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  // Potentially link back to the definition if needed, though maybe redundant
+  // warrantyDefinitionId Int?
+  // warrantyDefinition WarrantyDefinition? @relation(fields: [warrantyDefinitionId], references: [id])
+
+  // Relation to sales tracking (optional)
+  // warrantySales WarrantySale[]
+}
+
+// Links a WarrantyDefinition to a Shopify Product or Collection
+model ProductAssociation {
+  id                   Int      @id @default(autoincrement())
+  warrantyDefinitionId Int
+  warrantyDefinition   WarrantyDefinition @relation(fields: [warrantyDefinitionId], references: [id])
+
+  // Store either product GID or collection GID
+  shopifyResourceId    String   // gid://shopify/Product/... or gid://shopify/Collection/...
+  resourceType         String   // "PRODUCT" or "COLLECTION"
+  isActive             Boolean  @default(true) // To easily enable/disable association
+  // Add exclusion logic if needed, e.g., isExclusion Boolean @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@unique([warrantyDefinitionId, shopifyResourceId]) // Ensure unique association
+}
+
+// Optional: Explicitly track warranty sales for easier dashboard reporting
+// model WarrantySale {
+//   id                Int      @id @default(autoincrement())
+//   shopifyOrderId    String   // gid://shopify/Order/...
+//   shopifyLineItemId String   @unique // gid://shopify/LineItem/...
+//   warrantyProductId Int
+//   warrantyProduct   WarrantyProduct @relation(fields: [warrantyProductId], references: [id])
+//   customerShopifyId String?  // gid://shopify/Customer/... (optional)
+//   salePrice         Float
+//   saleDate          DateTime @default(now())
+// }
