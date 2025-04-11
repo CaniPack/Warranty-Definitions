@@ -5,7 +5,8 @@ import { json } from "@remix-run/node";
 import { useLoaderData, useFetcher } from "@remix-run/react";
 import {
   Page, Card, Layout, BlockStack, Text, IndexTable, Button,
-  Toast, Frame, Modal, FormLayout, TextField, Select, Banner
+  Frame, Modal, FormLayout, TextField, Select, Banner,
+  Toast
 } from "@shopify/polaris";
 import prisma from "~/db.server"; // Import the Prisma client
 import type { WarrantyDefinition } from "@prisma/client"; // Usaremos este directamente
@@ -43,7 +44,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
 };
 
-// Action: Handles different intents, including 'create'
+// Action: Handles different intents, including 'create' and 'delete'
 export const action = async ({ request }: ActionFunctionArgs) => {
   await authenticate.admin(request);
   const formData = await request.formData();
@@ -85,8 +86,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     // Return errors if validation fails
     if (Object.keys(errors).length > 0) {
        return json(
-         // Return fieldValues so form can re-populate
-         { errors, fieldValues: Object.fromEntries(formData) },
+         { status: 'error', errors, fieldValues: Object.fromEntries(formData) },
          { status: 400 }
        );
     }
@@ -96,23 +96,64 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const newDefinition = await prisma.warrantyDefinition.create({
         data: { name, durationMonths, priceType, priceValue, description: description || null },
       });
-      // Return success message for the fetcher to handle
-      return json({ successMessage: `Warranty definition "${newDefinition.name}" created successfully!` });
+      // Return different success structure including ID
+      return json({
+         status: 'success',
+         message: `Warranty definition "${newDefinition.name}" created successfully!`, 
+         newDefinitionId: newDefinition.id
+      });
     } catch (error) {
       console.error("Failed to create warranty definition:", error);
-      // Handle potential unique constraint errors if name should be unique
-      // if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') { ... }
       return json(
-         { errors: { form: "Failed to save warranty definition to the database." }, fieldValues: Object.fromEntries(formData) },
+         { status: 'error', errors: { form: "Failed to save warranty definition to the database." }, fieldValues: Object.fromEntries(formData) },
          { status: 500 }
        );
     }
     // --- END CREATE LOGIC ---
+  } else if (intent === "delete") {
+    // --- DELETE LOGIC ---
+    const idToDeleteStr = formData.get("id") as string; 
+    if (!idToDeleteStr) {
+      return json({ status: 'error', errors: { form: "Missing ID for deletion." } }, { status: 400 });
+    }
+    const idToDelete = parseInt(idToDeleteStr, 10);
+    if (isNaN(idToDelete)) {
+      return json({ status: 'error', errors: { form: "Invalid ID format." } }, { status: 400 });
+    }
+
+    try {
+      // Find the definition first to get its name
+      const definitionToDelete = await prisma.warrantyDefinition.findUnique({
+        where: { id: idToDelete },
+        select: { name: true } // Only select the name
+      });
+
+      if (!definitionToDelete) {
+        return json({ status: 'error', errors: { form: "Warranty definition not found." } }, { status: 404 });
+      }
+
+      // Now delete it
+      await prisma.warrantyDefinition.delete({ where: { id: idToDelete } });
+      
+      // Return success message with the name
+      return json({ 
+          status: 'success', 
+          message: `Warranty definition "${definitionToDelete.name}" deleted successfully.` 
+      });
+
+    } catch (error) {
+      console.error("Failed to delete warranty definition:", error);
+      return json(
+         { status: 'error', errors: { form: "Failed to delete warranty definition." } },
+         { status: 500 }
+       );
+    }
+    // --- END DELETE LOGIC ---
   }
 
-  // Handle other intents later (e.g., delete)
+  // Handle other intents
   console.warn(`Unhandled intent: ${intent}`);
-  return json({ errors: { form: "Invalid operation requested." } }, { status: 400 });
+  return json({ status: 'error', errors: { form: "Invalid operation requested." } }, { status: 400 });
 };
 
 
@@ -121,13 +162,27 @@ export default function WarrantyDefinitionsPage() {
   const { warrantyDefinitions } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
 
+  // Restore Toast state
   const [toastActive, setToastActive] = useState(false);
   const [toastMessage, setToastMessage] = useState('');
   const toggleToastActive = useCallback(() => setToastActive((active) => !active), []);
 
-  const [modalOpen, setModalOpen] = useState(false);
-  const handleOpenModal = useCallback(() => setModalOpen(true), []);
-  const handleCloseModal = useCallback(() => setModalOpen(false), []);
+  // --- State ---
+  const [createModalOpen, setCreateModalOpen] = useState(false);
+  const handleOpenCreateModal = useCallback(() => setCreateModalOpen(true), []);
+  const handleCloseCreateModal = useCallback(() => setCreateModalOpen(false), []);
+
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [definitionIdToDelete, setDefinitionIdToDelete] = useState<number | null>(null);
+  // Correct handler to set the ID and open the modal
+  const handleOpenDeleteModal = useCallback((id: number) => {
+      setDefinitionIdToDelete(id);
+      setDeleteModalOpen(true);
+  }, []);
+  const handleCloseDeleteModal = useCallback(() => {
+      setDefinitionIdToDelete(null);
+      setDeleteModalOpen(false);
+  }, []);
 
   const [formState, setFormState] = useState({
       name: '', durationMonths: '12', priceType: 'PERCENTAGE',
@@ -141,47 +196,58 @@ export default function WarrantyDefinitionsPage() {
    );
 
    useEffect(() => {
-       if (modalOpen) {
+       if (createModalOpen) {
            setFormState({ name: '', durationMonths: '12', priceType: 'PERCENTAGE', priceValue: '10', description: '' });
-           // Consider resetting fetcher state if needed, though it might reset automatically on new submission
        }
-   }, [modalOpen]);
+   }, [createModalOpen]);
 
-  // Handle fetcher completion with type guards
+  // Handle fetcher completion (Create and Delete)
   useEffect(() => {
     if (fetcher.state === 'idle' && fetcher.data) {
         const data = fetcher.data;
-        // Check if successMessage exists
-        if (typeof data === 'object' && data !== null && 'successMessage' in data && typeof data.successMessage === 'string') {
-          handleCloseModal();
-          setToastMessage(data.successMessage);
+
+        if (typeof data === 'object' && data !== null && data.status === 'success') {
+          const successData = data as { message: string }; 
+          // Close the correct modal based on which one was likely open
+          // A more robust way might check fetcher.formData if needed
+          if (createModalOpen) handleCloseCreateModal();
+          if (deleteModalOpen) handleCloseDeleteModal(); // <<< CLOSE DELETE MODAL
+          
+          setToastMessage(successData.message);
           setToastActive(true);
         } 
-        // Check if fieldValues exists (implies error state for repopulation)
-        else if (typeof data === 'object' && data !== null && 'fieldValues' in data && data.fieldValues) {
-           const values = data.fieldValues as any; // Use type assertion carefully
-           setFormState({
-               name: values.name || '',
-               durationMonths: values.durationMonths || '12',
-               priceType: values.priceType || 'PERCENTAGE',
-               priceValue: values.priceValue || '10',
-               description: values.description || '',
-           });
+        else if (typeof data === 'object' && data !== null && data.status === 'error' && 'fieldValues' in data) {
+          const errorData = data as { fieldValues: any; errors?: Record<string, string> | { form: string } };
+          const values = errorData.fieldValues;
+          if (values) {
+              setFormState({
+                  name: values.name || '',
+                  durationMonths: values.durationMonths || '12',
+                  priceType: values.priceType || 'PERCENTAGE',
+                  priceValue: values.priceValue || '10',
+                  description: values.description || '',
+              });
+          }
+          // Optional: Show error toast using state
+          if (errorData.errors && 'form' in errorData.errors) {
+              // You could set an error message and activate the toast here too
+              // setToastMessage(errorData.errors.form);
+              // setToastActive(true);
+              // If showing error toasts, you'll need logic to set the tone dynamically
+          }
         }
     }
-  }, [fetcher.state, fetcher.data, handleCloseModal]);
+    // Add handleCloseDeleteModal to dependency array
+  }, [fetcher.state, fetcher.data, handleCloseCreateModal, handleCloseDeleteModal, createModalOpen, deleteModalOpen]); 
 
-  // Extract errors safely from fetcher data
-  const errors = (fetcher.state === 'idle' && fetcher.data && typeof fetcher.data === 'object' && 'errors' in fetcher.data) 
-                 ? fetcher.data.errors as Record<string, string> | { form: string } 
-                 : null;
+  // Extract errors safely based on status
+  let errors: Record<string, string> | { form: string } | null = null;
+  if (fetcher.state === 'idle' && fetcher.data && typeof fetcher.data === 'object' && fetcher.data.status === 'error' && 'errors' in fetcher.data) {
+      errors = fetcher.data.errors as Record<string, string> | { form: string };
+  }
                  
   const fieldErrors = (errors && !('form' in errors)) ? errors as Record<string, string> : null;
   const generalFormError = (errors && 'form' in errors) ? errors.form : null;
-
-  const toastMarkup = toastActive ? (
-    <Toast content={toastMessage} onDismiss={toggleToastActive} />
-  ) : null;
 
   const resourceName = {
     singular: 'warranty definition',
@@ -191,8 +257,8 @@ export default function WarrantyDefinitionsPage() {
   // Modal Markup (ensure form fields use calculated errors)
   const createModalMarkup = (
       <Modal
-          open={modalOpen}
-          onClose={handleCloseModal}
+          open={createModalOpen}
+          onClose={handleCloseCreateModal}
           title="Create New Warranty Definition"
           primaryAction={{
               content: 'Save',
@@ -210,7 +276,7 @@ export default function WarrantyDefinitionsPage() {
           secondaryActions={[
               {
                   content: 'Cancel',
-                  onAction: handleCloseModal,
+                  onAction: handleCloseCreateModal,
                   disabled: fetcher.state !== 'idle',
               },
           ]}
@@ -285,6 +351,51 @@ export default function WarrantyDefinitionsPage() {
       </Modal>
   );
 
+  // Restore toastMarkup variable (ignoring linter error for tone)
+  const toastMarkup = toastActive ? (
+    <Toast 
+      content={toastMessage} 
+      onDismiss={toggleToastActive} 
+      tone="success" 
+      duration={90000}
+    />
+  ) : null;
+
+  // Delete Confirmation Modal Markup
+  const deleteModalMarkup = (
+      <Modal
+          open={deleteModalOpen}
+          onClose={handleCloseDeleteModal}
+          title="Delete Warranty Definition?"
+          primaryAction={{
+              content: 'Delete',
+              destructive: true,
+              onAction: () => {
+                  if (definitionIdToDelete !== null) {
+                     const formData = new FormData();
+                     formData.append('intent', 'delete');
+                     formData.append('id', definitionIdToDelete.toString());
+                     fetcher.submit(formData, { method: 'post' });
+                  }
+              },
+              loading: fetcher.state !== 'idle',
+          }}
+          secondaryActions={[
+              {
+                  content: 'Cancel',
+                  onAction: handleCloseDeleteModal,
+                  disabled: fetcher.state !== 'idle',
+              },
+          ]}
+      >
+          <Modal.Section>
+              <Text as="p">
+                  Are you sure you want to delete this warranty definition? This action cannot be undone.
+              </Text>
+          </Modal.Section>
+      </Modal>
+  );
+
   return (
     <Frame>
       <Page fullWidth title="Warranty Definitions">
@@ -303,7 +414,7 @@ export default function WarrantyDefinitionsPage() {
                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
                    <Button
                      variant="primary"
-                     onClick={handleOpenModal}
+                     onClick={handleOpenCreateModal}
                    >
                      Create Warranty Definition
                    </Button>
@@ -335,9 +446,17 @@ export default function WarrantyDefinitionsPage() {
                          </IndexTable.Cell>
                          <IndexTable.Cell>{definition.description || '—'}</IndexTable.Cell>
                           <IndexTable.Cell>
-                            <BlockStack inlineAlign="start" gap="100"> {/* Use BlockStack for button layout */}
-                                <Button size="slim" disabled>Edit</Button> {/* TODO: Implement Edit */}
-                                <Button size="slim" variant="tertiary" tone="critical" disabled>Delete</Button> {/* TODO: Implement Delete */}
+                            <BlockStack inlineAlign="start" gap="100">
+                                <Button size="slim" disabled>Edit</Button>
+                                <Button 
+                                  size="slim" 
+                                  variant="tertiary" 
+                                  tone="critical"
+                                  onClick={() => handleOpenDeleteModal(definition.id)}
+                                  disabled={fetcher.state !== 'idle'}
+                                 >
+                                   Delete
+                                 </Button>
                             </BlockStack>
                          </IndexTable.Cell>
                        </IndexTable.Row>
@@ -356,6 +475,7 @@ export default function WarrantyDefinitionsPage() {
         </Layout>
         {toastMarkup}
         {createModalMarkup}
+        {deleteModalMarkup}
       </Page>
     </Frame>
   );
