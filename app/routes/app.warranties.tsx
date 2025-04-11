@@ -44,7 +44,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
 };
 
-// Action: Handles different intents, including 'create' and 'delete'
+// Action: Handles create, delete, and update
 export const action = async ({ request }: ActionFunctionArgs) => {
   await authenticate.admin(request);
   const formData = await request.formData();
@@ -149,6 +149,68 @@ export const action = async ({ request }: ActionFunctionArgs) => {
        );
     }
     // --- END DELETE LOGIC ---
+  } else if (intent === "update") {
+    // --- UPDATE LOGIC ---
+    const idToUpdateStr = formData.get("id") as string;
+    const name = formData.get("name") as string;
+    const durationMonthsStr = formData.get("durationMonths") as string;
+    const priceType = formData.get("priceType") as string;
+    const priceValueStr = formData.get("priceValue") as string;
+    const description = formData.get("description") as string | null;
+
+    if (!idToUpdateStr) {
+        return json({ status: 'error', errors: { form: "Missing ID for update." } }, { status: 400 });
+    }
+    const idToUpdate = parseInt(idToUpdateStr, 10);
+     if (isNaN(idToUpdate)) {
+       return json({ status: 'error', errors: { form: "Invalid ID format for update." } }, { status: 400 });
+     }
+
+    const errors: Record<string, string> = {};
+    let durationMonths = NaN;
+    let priceValue = NaN;
+
+    // Validation (same as create)
+    if (!name) errors.name = "Name is required.";
+    if (!durationMonthsStr) errors.durationMonths = "Duration is required.";
+    else {
+      durationMonths = parseInt(durationMonthsStr, 10);
+      if (isNaN(durationMonths) || durationMonths <= 0) errors.durationMonths = "Duration must be a positive number.";
+    }
+    if (!priceType) errors.priceType = "Price type is required.";
+    else if (priceType !== "PERCENTAGE" && priceType !== "FIXED") errors.priceType = "Invalid price type selected.";
+    if (!priceValueStr) errors.priceValue = "Price value is required.";
+    else {
+       priceValue = parseFloat(priceValueStr);
+       if (isNaN(priceValue) || priceValue < 0) errors.priceValue = "Price value must be a non-negative number.";
+    }
+
+    // Return errors if validation fails
+    if (Object.keys(errors).length > 0) {
+       return json(
+         { status: 'error', errors, fieldValues: Object.fromEntries(formData) }, 
+         { status: 400 }
+       );
+    }
+
+    // Update in DB if valid
+    try {
+      await prisma.warrantyDefinition.update({
+        where: { id: idToUpdate },
+        data: { name, durationMonths, priceType, priceValue, description: description || null },
+      });
+      // Return success message for update
+      return json({ status: 'success', message: `Warranty definition "${name}" updated successfully!` });
+    } catch (error) {
+      console.error("Failed to update warranty definition:", error);
+      // Handle potential errors like record not found
+      // if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') { ... }
+      return json(
+         { status: 'error', errors: { form: "Failed to update warranty definition." }, fieldValues: Object.fromEntries(formData) },
+         { status: 500 }
+       );
+    }
+    // --- END UPDATE LOGIC ---
   }
 
   // Handle other intents
@@ -159,7 +221,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 // --- Frontend Component ---
 export default function WarrantyDefinitionsPage() {
-  const { warrantyDefinitions } = useLoaderData<typeof loader>();
+  const { warrantyDefinitions: loaderDefinitions } = useLoaderData<typeof loader>(); // Rename loader data
   const fetcher = useFetcher<typeof action>();
 
   // Restore Toast state
@@ -168,9 +230,8 @@ export default function WarrantyDefinitionsPage() {
   const toggleToastActive = useCallback(() => setToastActive((active) => !active), []);
 
   // --- State ---
-  const [createModalOpen, setCreateModalOpen] = useState(false);
-  const handleOpenCreateModal = useCallback(() => setCreateModalOpen(true), []);
-  const handleCloseCreateModal = useCallback(() => setCreateModalOpen(false), []);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingDefinition, setEditingDefinition] = useState<WarrantyDefinition | null>(null);
 
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [definitionIdToDelete, setDefinitionIdToDelete] = useState<number | null>(null);
@@ -195,95 +256,107 @@ export default function WarrantyDefinitionsPage() {
        }, [],
    );
 
-   useEffect(() => {
-       if (createModalOpen) {
-           setFormState({ name: '', durationMonths: '12', priceType: 'PERCENTAGE', priceValue: '10', description: '' });
-       }
-   }, [createModalOpen]);
+  // Handlers for opening/closing the modal
+  const handleOpenCreateModal = useCallback(() => {
+      setEditingDefinition(null); // Ensure we are in create mode
+      setFormState({ name: '', durationMonths: '12', priceType: 'PERCENTAGE', priceValue: '10', description: '' }); // Reset form
+      setModalOpen(true);
+  }, []);
 
-  // Handle fetcher completion (Create and Delete)
+  const handleOpenEditModal = useCallback((definition: WarrantyDefinition) => {
+      setEditingDefinition(definition); // Set the definition to edit
+      setFormState({
+          name: definition.name,
+          durationMonths: definition.durationMonths.toString(), 
+          priceType: definition.priceType,
+          priceValue: definition.priceValue.toString(), 
+          description: definition.description || '',
+      });
+      setModalOpen(true);
+  }, []);
+
+  const handleCloseModal = useCallback(() => {
+      setModalOpen(false);
+      setEditingDefinition(null); // Clear editing state on close
+  }, []);
+
+  // Type warrantyDefinitions explicitly after loader using double assertion
+  const warrantyDefinitions = loaderDefinitions as unknown as WarrantyDefinition[];
+  
+  // Handle fetcher completion
   useEffect(() => {
     if (fetcher.state === 'idle' && fetcher.data) {
         const data = fetcher.data;
 
         if (typeof data === 'object' && data !== null && data.status === 'success') {
           const successData = data as { message: string }; 
-          // Close the correct modal based on which one was likely open
-          // A more robust way might check fetcher.formData if needed
-          if (createModalOpen) handleCloseCreateModal();
-          if (deleteModalOpen) handleCloseDeleteModal(); // <<< CLOSE DELETE MODAL
-          
+          handleCloseModal(); 
+          if (deleteModalOpen) handleCloseDeleteModal();
           setToastMessage(successData.message);
           setToastActive(true);
         } 
-        else if (typeof data === 'object' && data !== null && data.status === 'error' && 'fieldValues' in data) {
-          const errorData = data as { fieldValues: any; errors?: Record<string, string> | { form: string } };
-          const values = errorData.fieldValues;
-          if (values) {
-              setFormState({
-                  name: values.name || '',
-                  durationMonths: values.durationMonths || '12',
-                  priceType: values.priceType || 'PERCENTAGE',
-                  priceValue: values.priceValue || '10',
-                  description: values.description || '',
-              });
+        else if (typeof data === 'object' && data !== null && data.status === 'error') {
+          const errorData = data as { fieldValues?: any; errors?: Record<string, string> | { form: string } }; 
+          // Repopulate form only if fieldValues exists (error during create/update)
+          if (modalOpen && errorData.fieldValues) {
+             const values = errorData.fieldValues; 
+             setFormState({
+                 name: values.name || '',
+                 durationMonths: values.durationMonths || '12',
+                 priceType: values.priceType || 'PERCENTAGE',
+                 priceValue: values.priceValue || '10',
+                 description: values.description || '',
+             });
           }
-          // Optional: Show error toast using state
-          if (errorData.errors && 'form' in errorData.errors) {
-              // You could set an error message and activate the toast here too
-              // setToastMessage(errorData.errors.form);
-              // setToastActive(true);
-              // If showing error toasts, you'll need logic to set the tone dynamically
+          // Show form-level error toast 
+          if (errorData.errors && 'form' in errorData.errors) { 
+              setToastMessage(errorData.errors.form);
+              setToastActive(true);
           }
         }
     }
-    // Add handleCloseDeleteModal to dependency array
-  }, [fetcher.state, fetcher.data, handleCloseCreateModal, handleCloseDeleteModal, createModalOpen, deleteModalOpen]); 
+  }, [fetcher.state, fetcher.data, handleCloseModal, handleCloseDeleteModal, modalOpen, deleteModalOpen]);
 
-  // Extract errors safely based on status
-  let errors: Record<string, string> | { form: string } | null = null;
+  // Extract errors safely based on fetcher state and data structure
+  let currentErrors: Record<string, string> | { form: string } | null = null;
   if (fetcher.state === 'idle' && fetcher.data && typeof fetcher.data === 'object' && fetcher.data.status === 'error' && 'errors' in fetcher.data) {
-      errors = fetcher.data.errors as Record<string, string> | { form: string };
+      currentErrors = fetcher.data.errors as Record<string, string> | { form: string };
   }
                  
-  const fieldErrors = (errors && !('form' in errors)) ? errors as Record<string, string> : null;
-  const generalFormError = (errors && 'form' in errors) ? errors.form : null;
+  const fieldErrors = (currentErrors && !('form' in currentErrors)) ? currentErrors as Record<string, string> : null;
+  const generalFormError = (currentErrors && 'form' in currentErrors) ? currentErrors.form : null;
 
   const resourceName = {
     singular: 'warranty definition',
     plural: 'warranty definitions',
   };
 
-  // Modal Markup (ensure form fields use calculated errors)
-  const createModalMarkup = (
+  // Create/Edit Modal Markup (replaces createModalMarkup)
+  const formModalMarkup = (
       <Modal
-          open={createModalOpen}
-          onClose={handleCloseCreateModal}
-          title="Create New Warranty Definition"
+          open={modalOpen} // Use single state
+          onClose={handleCloseModal} // Use single handler
+          title={editingDefinition ? "Edit Warranty Definition" : "Create New Warranty Definition"} // Dynamic title
           primaryAction={{
               content: 'Save',
-              // Use fetcher.submit with the form ID when clicked
               onAction: () => {
-                  const form = document.getElementById('create-warranty-form');
-                  if (form instanceof HTMLFormElement) {
-                      fetcher.submit(form);
-                  } else {
-                      console.error("Could not find form#create-warranty-form to submit");
-                  }
+                  const form = document.getElementById('warranty-form'); // Use consistent ID
+                  if (form instanceof HTMLFormElement) { fetcher.submit(form); }
               },
-              loading: fetcher.state !== 'idle',
+              loading: fetcher.state !== 'idle' && (fetcher.formData?.get('intent') === 'create' || fetcher.formData?.get('intent') === 'update'),
           }}
           secondaryActions={[
-              {
-                  content: 'Cancel',
-                  onAction: handleCloseCreateModal,
-                  disabled: fetcher.state !== 'idle',
-              },
+              { content: 'Cancel', onAction: handleCloseModal, disabled: fetcher.state !== 'idle' },
           ]}
       >
           <Modal.Section>
-              <fetcher.Form method="post" id="create-warranty-form">
-                  <input type="hidden" name="intent" value="create" />
+              {/* Use the same form ID */}
+              <fetcher.Form method="post" id="warranty-form"> 
+                  {/* Dynamic intent and optional ID */}
+                  <input type="hidden" name="intent" value={editingDefinition ? "update" : "create"} />
+                  {editingDefinition && (
+                      <input type="hidden" name="id" value={editingDefinition.id} />
+                  )}
                   <FormLayout>
                       {generalFormError && (
                            <Banner title="Error saving definition" tone="critical">
@@ -431,10 +504,10 @@ export default function WarrantyDefinitionsPage() {
                      ]}
                      selectable={false}
                    >
-                     {warrantyDefinitions.map((definition: any, index: number) => (
+                     {warrantyDefinitions.map((definition, index) => (
                        <IndexTable.Row
-                         id={definition.id?.toString() ?? `row-${index}`}
-                         key={definition.id ?? index}
+                         id={definition.id.toString()}
+                         key={definition.id}
                          position={index}
                        >
                          <IndexTable.Cell>{definition.name ?? 'N/A'}</IndexTable.Cell>
@@ -447,7 +520,11 @@ export default function WarrantyDefinitionsPage() {
                          <IndexTable.Cell>{definition.description || '—'}</IndexTable.Cell>
                           <IndexTable.Cell>
                             <BlockStack inlineAlign="start" gap="100">
-                                <Button size="slim" disabled>Edit</Button>
+                                <Button 
+                                  size="slim" 
+                                  onClick={() => handleOpenEditModal(definition as unknown as WarrantyDefinition)}
+                                  disabled={fetcher.state !== 'idle'} 
+                               >Edit</Button>
                                 <Button 
                                   size="slim" 
                                   variant="tertiary" 
@@ -474,7 +551,7 @@ export default function WarrantyDefinitionsPage() {
           </Layout.Section>
         </Layout>
         {toastMarkup}
-        {createModalMarkup}
+        {formModalMarkup}
         {deleteModalMarkup}
       </Page>
     </Frame>
