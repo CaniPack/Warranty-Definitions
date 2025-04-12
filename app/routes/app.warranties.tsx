@@ -361,7 +361,7 @@ export default function WarrantyDefinitionsPage() {
         }
       }
     }
-  }, [fetcher.state, fetcher.data, modalOpen, handleCloseModal, handleCloseDeleteModal]); // Consolidated dependencies
+  }, [fetcher.state, fetcher.data, handleCloseModal, handleCloseDeleteModal]);
 
   // Effect to auto-dismiss success message banner
   useEffect(() => {
