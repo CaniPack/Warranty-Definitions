@@ -7,7 +7,7 @@ import {
   useNavigate,
   // Form, // Removed as fetcher.Form is used
 } from "@remix-run/react";
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import {
   Page, Card, Layout, BlockStack, Text, IndexTable, Button,
   Frame, Modal, FormLayout, TextField, Select, Banner,
@@ -18,6 +18,7 @@ import prisma from "~/db.server"; // Import the Prisma client
 import { WarrantyDefinition } from "@prisma/client";
 // import { ResourcePicker, useAppBridge } from '@shopify/app-bridge-react'; // Re-added - Linter says ResourcePicker doesn't exist
 // import { useAppBridge } from '@shopify/app-bridge-react'; // Commented out as ResourcePicker is removed again
+import { getSession, commitSession } from "../sessions.server"; // Import session functions
 
 // --- Local Type Definitions ---
 
@@ -42,15 +43,15 @@ interface WarrantyDefinitionFromLoader extends Omit<WarrantyDefinition, 'created
 
 interface LoaderData {
   warrantyDefinitions: WarrantyDefinitionFromLoader[];
-  successMessage?: string | null; // Optional success message from previous actions
+  successMessage?: string | null; // Message from session flash
 }
 
 // Action function return types
 interface ActionDataSuccess {
   status: 'success';
-  message: string;
-  definition?: WarrantyDefinitionFromLoader; // Return the created/updated definition (serialized)
-  deletedId?: number; // Return the ID of the deleted definition
+  // No longer returning definition/id directly on success, redirecting instead
+  message?: string; // Can keep for consistency but won't be used if redirecting
+  deletedId?: number;
 }
 
 interface ActionDataError {
@@ -60,16 +61,18 @@ interface ActionDataError {
   fieldValues?: Record<string, any>; // Added back to repopulate form on error
 }
 
-type ActionData = ActionDataSuccess | ActionDataError;
+type ActionData = ActionDataSuccess | ActionDataError; // Success type is less relevant now
 
 
-// Loader: Fetch warranty definitions
+// Loader: Fetch warranty definitions and read flash message
 export const loader = async ({ request }: LoaderFunctionArgs): Promise<TypedResponse<LoaderData>> => {
   console.log("🚨 SPARK LOADER START 🚨");
-  try {
-    const url = new URL(request.url);
-    const successMessage = url.searchParams.get("successMessage");
 
+  // Get session and potential flash message
+  const session = await getSession(request.headers.get("Cookie"));
+  const successMessage = session.get("successMessage") as string | null || null; // Read flash message
+
+  try {
     // Fetch definitions - removed association fields from select again
     const definitionsDb = await prisma.warrantyDefinition.findMany({
       orderBy: { createdAt: 'desc' },
@@ -97,19 +100,25 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<TypedResp
         // No association fields to map
     }));
 
-
-    return json({ warrantyDefinitions: definitionsFrontend, successMessage });
+    // Return data and commit session (to clear flash message from cookie)
+    return json(
+        { warrantyDefinitions: definitionsFrontend, successMessage },
+        { headers: { "Set-Cookie": await commitSession(session) } }
+    );
 
   } catch (error) {
     console.error("🚨 SPARK LOADER ERROR 🚨:", error);
+    // Commit session even on error? Might depend on desired behavior.
+    // For now, just rethrow, session commit won't happen.
     throw error; // Ensure a Response or Error is thrown
   }
 };
 
 
-// Action: Handle Create, Update, Delete
-export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResponse<ActionData>> => {
+// Action: Handle Create, Update, Delete and set flash message on success
+export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResponse<ActionData> | Response> => {
   console.log("🚨 SPARK ACTION START 🚨");
+  const session = await getSession(request.headers.get("Cookie"));
   const formData = await request.formData();
   const actionType = formData.get("actionType");
   const id = formData.get("id"); // Used for update/delete
@@ -123,10 +132,13 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResp
       try {
         await prisma.warrantyDefinition.delete({ where: { id: Number(id) } });
         console.log(`Deleted definition ${id}`);
-        // Return JSON success for fetcher.Form to handle state update
+        // Return JSON success for fetcher to handle UI update immediately
         return json({ status: 'success', message: 'Warranty definition deleted successfully.', deletedId: Number(id) });
-        // Redirect was causing issues with fetcher state, switched to JSON response
-        // return redirect(`/app/warranties?successMessage=Warranty definition deleted successfully`);
+        // // Set flash message and redirect (Removed - Causes delayed UI update)
+        // session.flash("successMessage", "Warranty definition deleted successfully.");
+        // return redirect("/app/warranties", {
+        //     headers: { "Set-Cookie": await commitSession(session) }
+        // });
       } catch (error: any) {
           if (error.code === 'P2025') {
               console.error(`Attempted to delete non-existent definition ${id}`);
@@ -157,6 +169,7 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResp
 
     if (Object.keys(errors).length > 0) {
       const fieldValues = Object.fromEntries(formData);
+      // Return validation errors for fetcher to handle
       return json({ status: 'error', message: 'Validation failed', errors, fieldValues }, { status: 400 });
     }
 
@@ -174,12 +187,11 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResp
       // associatedCollectionIds: associatedCollectionIds, // Removed again
     };
 
-    let savedDefinitionDb;
     let successMessage: string;
 
     if (actionType === "update" && id) {
       // Update existing definition
-      savedDefinitionDb = await prisma.warrantyDefinition.update({
+      await prisma.warrantyDefinition.update({
         where: { id: Number(id) },
         data: dataToSave,
       });
@@ -187,48 +199,48 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResp
       console.log(`Updated definition ${id}`);
     } else {
       // Create new definition
-      savedDefinitionDb = await prisma.warrantyDefinition.create({
+      const newDef = await prisma.warrantyDefinition.create({
         data: dataToSave,
       });
       successMessage = "Warranty definition created successfully";
-      console.log(`Created new definition ${savedDefinitionDb.id}`);
+      console.log(`Created new definition ${newDef.id}`);
     }
 
-    // Manually construct the serialized version for the response
-    const responseDefinition: WarrantyDefinitionFromLoader = {
-        ...savedDefinitionDb,
-        priceType: savedDefinitionDb.priceType as PriceType, // Assert to local enum
-        createdAt: savedDefinitionDb.createdAt.toISOString(),
-        updatedAt: savedDefinitionDb.updatedAt.toISOString(),
-        // No association fields
-    };
-
-
-    // Return success state with the saved definition (serialized)
-    return json({ status: 'success', message: successMessage, definition: responseDefinition });
+    // Set flash message and redirect *only for create/update*
+    session.flash("successMessage", successMessage);
+    return redirect("/app/warranties", {
+        headers: { "Set-Cookie": await commitSession(session) }
+    });
 
   } catch (error: any) {
     console.error("🚨 SPARK ACTION ERROR 🚨:", error);
+    // Handle generic errors (like unique constraints P2002)
+    let errorMessage = `Failed to ${actionType || 'save'} definition: ${error.message || 'Unknown error'}`;
+    let status = 500;
     if (error.code === 'P2002') {
-         return json({ status: 'error', message: 'A definition with similar key fields might already exist.' }, { status: 409 }); // Conflict
+        errorMessage = 'A definition with similar key fields might already exist.';
+        status = 409; // Conflict
     }
-    return json({ status: 'error', message: `Failed to ${actionType || 'save'} definition: ${error.message || 'Unknown error'}` }, { status: 500 });
+    // Return JSON error for fetcher
+    return json({ status: 'error', message: errorMessage }, { status });
   }
 };
 
 
 // --- Frontend Component ---
 export default function WarrantyDefinitionsPage() {
-  // Use the adjusted type reflecting serialized data
+  // Read loader data, including potential flash message
   const { warrantyDefinitions: initialWarrantyDefinitions, successMessage: initialSuccessMessage } = useLoaderData<LoaderData>();
 
-  // State for the definitions displayed in the table - ensure type matches LoaderData
+  // State for the definitions (updated by page loads)
   const [warrantyDefinitions, setWarrantyDefinitions] = useState<WarrantyDefinitionFromLoader[]>(initialWarrantyDefinitions);
-  // Local state for success message to allow dismissal
+  // Local state for success message (initialized from loader flash message)
   const [successMessage, setSuccessMessage] = useState<string | null>(initialSuccessMessage || null);
+  // Ref for the auto-dismiss timeout
+  const successTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const fetcher = useFetcher<ActionData>();
-  const navigate = useNavigate(); // For potential navigation/redirects
+  const navigate = useNavigate();
   // const appBridge = useAppBridge(); // Removed again
 
   // Form State (Create/Edit Modal)
@@ -252,71 +264,9 @@ export default function WarrantyDefinitionsPage() {
   // const [selectedProductIds, setSelectedProductIds] = useState<string[]>([]);
   // const [selectedCollectionIds, setSelectedCollectionIds] = useState<string[]>([]);
 
+  // --- Modal Handlers --- (Moved up)
 
-  // Effect to update table/state after successful CUD operations via fetcher
-  useEffect(() => {
-    if (fetcher.data && fetcher.state === 'idle') {
-      const data = fetcher.data; // Type guard for ActionData
-      if (data.status === 'success') {
-        console.log("Action successful:", data.message);
-        setSuccessMessage(data.message); // Show success banner
-
-        // Handle Create/Update success
-        if (data.definition) {
-          const updatedDefinition = data.definition;
-          setWarrantyDefinitions(prev => {
-            const index = prev.findIndex(def => def.id === updatedDefinition.id);
-            if (index > -1) {
-               const newState = [...prev];
-               newState[index] = updatedDefinition;
-               return newState;
-            } else {
-              return [updatedDefinition, ...prev];
-            }
-          });
-           handleCloseModal(); // Close create/edit modal on success
-        }
-        // Handle Delete success (now that it returns JSON)
-        else if (data.deletedId) {
-            const deletedId = data.deletedId;
-             setWarrantyDefinitions(prev => prev.filter(def => def.id !== deletedId));
-             handleCloseDeleteModal(); // Close delete confirmation modal on success
-        }
-
-        // handleCloseModal(); // Moved into specific success cases above
-
-      } else if (data.status === 'error') {
-        console.error("Action failed:", data.message);
-        // Repopulate form state if fieldValues were returned on validation error (for create/edit modal)
-        if (modalOpen && data.errors && data.fieldValues) {
-            const values = data.fieldValues as typeof formState;
-             setFormState({
-                 name: values.name || '',
-                 durationMonths: values.durationMonths || '',
-                 priceType: (Object.values(PriceType).includes(values.priceType as PriceType) ? values.priceType : PriceType.FIXED_AMOUNT) as PriceType,
-                 priceValue: values.priceValue || '',
-                 description: values.description || '',
-                 // associationType: values.associationType, // Removed again
-             });
-             // No need to repopulate picker IDs
-        }
-        // If the error was during delete, keep delete modal open to show error? Currently handled by Banner.
-      }
-    }
-  }, [fetcher.state, fetcher.data]); // Dependency array includes fetcher.data
-
-  // Updated handleInputChange to exclude removed fields
-  const handleInputChange = useCallback((value: string, field: keyof Omit<typeof formState, 'priceType'>) => {
-    setFormState(prev => ({ ...prev, [field]: value }));
-  }, []);
-
-  // Simplified handleSelectChange for PriceType only
-  const handleSelectChange = useCallback((value: PriceType, field: 'priceType') => {
-      setFormState(prev => ({ ...prev, [field]: value }));
-  }, []);
-
-
-  const handleOpenModalForCreate = () => {
+  const handleOpenModalForCreate = useCallback(() => {
     setEditingId(null);
     setFormState({ // Reset form
       name: '',
@@ -324,13 +274,11 @@ export default function WarrantyDefinitionsPage() {
       priceType: PriceType.FIXED_AMOUNT, // Use local enum
       priceValue: '',
       description: '',
-      // associationType: WarrantyAssociationType.ALL_PRODUCTS, // Removed again
     });
-    // No picker IDs to reset
     setModalOpen(true);
-  };
+  }, []);
 
-  const handleEdit = (definition: WarrantyDefinitionFromLoader) => { // Use adjusted type
+  const handleEdit = useCallback((definition: WarrantyDefinitionFromLoader) => {
     setEditingId(definition.id);
     setFormState({
         name: definition.name,
@@ -340,22 +288,19 @@ export default function WarrantyDefinitionsPage() {
                       ? (definition.priceValue / 100).toFixed(2)
                       : definition.priceValue.toString(),
         description: definition.description || '',
-        // associationType: definition.associationType, // Removed again
     });
-    // No picker IDs to set
     setModalOpen(true);
-  };
+  }, []);
 
-  const handleCloseModal = () => {
+  const handleCloseModal = useCallback(() => {
     setModalOpen(false);
     setEditingId(null);
-    // Optionally clear fetcher errors when closing manually
-    if (fetcher.data?.status === 'error') {
-        // Might want to clear fetcher.data here if errors persist visually
+    if (fetcher.data?.status === 'error' && fetcher.data.errors) {
+        // Maybe clear form state here too?
     }
-  };
+  }, [fetcher.data]); // Added fetcher.data dependency
 
-  // Handlers for Delete Confirmation Modal (Added)
+  // Handlers for Delete Confirmation Modal (Moved up)
   const handleOpenDeleteModal = useCallback((id: number) => {
     setDefinitionIdToDelete(id);
     setDeleteModalOpen(true);
@@ -364,7 +309,10 @@ export default function WarrantyDefinitionsPage() {
   const handleCloseDeleteModal = useCallback(() => {
     setDefinitionIdToDelete(null);
     setDeleteModalOpen(false);
-  }, []);
+     if (fetcher.data?.status === 'error' && fetcher.formData?.get('actionType') === 'delete') {
+        // Maybe clear fetcher.data?
+     }
+  }, [fetcher]); // Added fetcher dependency
 
   const handleDeleteDefinition = useCallback(() => {
     if (definitionIdToDelete !== null) {
@@ -372,9 +320,85 @@ export default function WarrantyDefinitionsPage() {
         formData.append('actionType', 'delete');
         formData.append('id', String(definitionIdToDelete));
         fetcher.submit(formData, { method: 'post' });
-        // Modal will be closed via useEffect on successful fetcher.data update
     }
   }, [definitionIdToDelete, fetcher]);
+
+  // --- Input Handlers --- (Moved up)
+  const handleInputChange = useCallback((value: string, field: keyof Omit<typeof formState, 'priceType'>) => {
+    setFormState(prev => ({ ...prev, [field]: value }));
+  }, []);
+
+  const handleSelectChange = useCallback((value: PriceType, field: 'priceType') => {
+      setFormState(prev => ({ ...prev, [field]: value }));
+  }, []);
+
+
+  // --- Effects --- (Grouped together)
+
+  // Effect to handle fetcher results (errors OR delete success)
+  useEffect(() => {
+    // Ensure fetcher is idle and has data
+    if (fetcher.state === 'idle' && fetcher.data) {
+      const data = fetcher.data;
+
+      if (data.status === 'success') {
+        // Handle Delete success (receives JSON response)
+        if (data.deletedId) {
+             console.log("Delete successful (via fetcher):", data.message);
+             // Set message state first
+             setSuccessMessage(data.message!); // Show success message (Assert non-null)
+             // Update definitions state based on previous state
+             setWarrantyDefinitions(prevDefs =>
+               prevDefs.filter(def => def.id !== data.deletedId)
+             ); // Update state immediately
+             // Close modal after state updates are queued
+             handleCloseDeleteModal(); // Close delete confirmation modal
+        }
+        // Create/Update success is handled by page reload after redirect.
+
+      } else if (data.status === 'error') {
+        console.error("Action failed:", data.message);
+        // Repopulate form state if validation errors occurred during create/edit
+        if (modalOpen && data.errors && data.fieldValues) {
+            const values = data.fieldValues as typeof formState;
+             setFormState({
+                 name: values.name || '',
+                 durationMonths: values.durationMonths || '',
+                 priceType: (Object.values(PriceType).includes(values.priceType as PriceType) ? values.priceType : PriceType.FIXED_AMOUNT) as PriceType,
+                 priceValue: values.priceValue || '',
+                 description: values.description || '',
+             });
+        }
+        // Note: Errors during delete are shown in the banner, modal might stay open or close depending on preference.
+      }
+    }
+    // Now includes handleCloseDeleteModal which is defined above
+  }, [fetcher.state, fetcher.data, modalOpen, handleCloseDeleteModal]);
+
+  // Effect to auto-dismiss success message banner (from loader OR delete fetcher response)
+  useEffect(() => {
+    // Clear previous timeout if message changes or component re-renders
+    if (successTimeoutRef.current) {
+      clearTimeout(successTimeoutRef.current);
+      successTimeoutRef.current = null;
+    }
+
+    // If there's a success message (either from loader or fetcher response), set timeout
+    if (successMessage) {
+       successTimeoutRef.current = setTimeout(() => {
+        setSuccessMessage(null);
+        successTimeoutRef.current = null;
+      }, 5000);
+    }
+
+    // Cleanup function
+    return () => {
+      if (successTimeoutRef.current) {
+        clearTimeout(successTimeoutRef.current);
+      }
+    };
+    // Now depends on the local successMessage state, not just initialSuccessMessage
+  }, [successMessage]);
 
 
   // Resource Picker Logic (Removed again)
@@ -389,21 +413,21 @@ export default function WarrantyDefinitionsPage() {
     >
       <Frame> {/* Frame is needed for Toasts and potentially Modals */}
         <BlockStack gap="500">
-          {/* Display Success/Error Banner */}
+          {/* Display Success Banner (from flash message) */}
           {successMessage && (
               <Banner title="Success" tone="success" onDismiss={() => setSuccessMessage(null)}>
                   <p>{successMessage}</p>
               </Banner>
           )}
+          {/* Display Fetcher Error Banner */}
           {fetcher.data?.status === 'error' && fetcher.state === 'idle' && (
               <Banner
                   title="Error"
                   tone='critical'
-                  // Keep error banner visible until next action or manual dismiss
-                  // onDismiss={() => { /* Optionally clear fetcher state or local error state */ }}
+                  // onDismiss={() => fetcher.data = undefined} // Avoid direct mutation
               >
                   <p>{fetcher.data.message}</p>
-                  {/* Display field-specific errors if they exist */}
+                  {/* Display field-specific errors if they exist (usually from create/edit) */}
                   {fetcher.data.errors && (
                     <BlockStack gap="100">
                         {Object.entries(fetcher.data.errors).map(([field, message]) => (
@@ -425,7 +449,6 @@ export default function WarrantyDefinitionsPage() {
             primaryAction={{
               content: editingId ? 'Save Changes' : 'Create Definition',
               onAction: () => {
-                // Submit the form data using the fetcher
                 const formData = new FormData();
                 formData.append('actionType', editingId ? 'update' : 'create');
                 if (editingId) {
@@ -433,17 +456,16 @@ export default function WarrantyDefinitionsPage() {
                 }
                 formData.append('name', formState.name);
                 formData.append('durationMonths', formState.durationMonths);
-                formData.append('priceType', formState.priceType); // Send local enum string value
+                formData.append('priceType', formState.priceType);
                 formData.append('priceValue', formState.priceValue);
                 formData.append('description', formState.description);
-                // No association data to append
-
                 fetcher.submit(formData, { method: 'post' });
               },
-              loading: fetcher.state === 'submitting' || fetcher.state === 'loading',
+              // Loading state applies to create/update actions
+              loading: fetcher.state !== 'idle' && (fetcher.formData?.get('actionType') === 'create' || fetcher.formData?.get('actionType') === 'update'),
               disabled: fetcher.state !== 'idle',
             }}
-            secondaryActions={[{ content: 'Cancel', onAction: handleCloseModal }]}
+            secondaryActions={[{ content: 'Cancel', onAction: handleCloseModal, disabled: fetcher.state !== 'idle' }]}
           >
             <Modal.Section>
               <FormLayout>
@@ -453,7 +475,8 @@ export default function WarrantyDefinitionsPage() {
                   onChange={(value) => handleInputChange(value, 'name')}
                   autoComplete="off"
                   requiredIndicator
-                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.name : undefined}
+                  // Show error only if fetcher failed for create/update and modal is open
+                  error={fetcher.data?.status === 'error' && modalOpen && (fetcher.formData?.get('actionType') === 'create' || fetcher.formData?.get('actionType') === 'update') ? fetcher.data.errors?.name : undefined}
                 />
                  <TextField
                   label="Duration (Months)"
@@ -462,7 +485,7 @@ export default function WarrantyDefinitionsPage() {
                   onChange={(value) => handleInputChange(value, 'durationMonths')}
                   autoComplete="off"
                   requiredIndicator
-                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.durationMonths : undefined}
+                  error={fetcher.data?.status === 'error' && modalOpen && (fetcher.formData?.get('actionType') === 'create' || fetcher.formData?.get('actionType') === 'update') ? fetcher.data.errors?.durationMonths : undefined}
                 />
                  <Select
                   label="Price Type"
@@ -470,23 +493,23 @@ export default function WarrantyDefinitionsPage() {
                     { label: 'Fixed Amount ($)', value: PriceType.FIXED_AMOUNT },
                     { label: 'Percentage (%)', value: PriceType.PERCENTAGE },
                   ]}
-                  value={formState.priceType} // Use local enum state
-                  onChange={(value) => handleSelectChange(value as PriceType, 'priceType')} // Use local enum
+                  value={formState.priceType}
+                  onChange={(value) => handleSelectChange(value as PriceType, 'priceType')}
                   requiredIndicator
-                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.priceType : undefined}
+                  error={fetcher.data?.status === 'error' && modalOpen && (fetcher.formData?.get('actionType') === 'create' || fetcher.formData?.get('actionType') === 'update') ? fetcher.data.errors?.priceType : undefined}
                 />
                  <TextField
-                  label={formState.priceType === PriceType.FIXED_AMOUNT ? "Price ($)" : "Price (%)"} // Use local enum
+                  label={formState.priceType === PriceType.FIXED_AMOUNT ? "Price ($)" : "Price (%)"}
                   type="number"
-                  prefix={formState.priceType === PriceType.FIXED_AMOUNT ? '$' : undefined} // Use local enum
-                  suffix={formState.priceType === PriceType.PERCENTAGE ? '%' : undefined} // Use local enum
+                  prefix={formState.priceType === PriceType.FIXED_AMOUNT ? '$' : undefined}
+                  suffix={formState.priceType === PriceType.PERCENTAGE ? '%' : undefined}
                   value={formState.priceValue}
                   onChange={(value) => handleInputChange(value, 'priceValue')}
                   autoComplete="off"
                   requiredIndicator
-                  step={formState.priceType === PriceType.FIXED_AMOUNT ? 0.01 : 1} // Use local enum & numeric step
+                  step={formState.priceType === PriceType.FIXED_AMOUNT ? 0.01 : 1}
                   min="0"
-                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.priceValue : undefined}
+                  error={fetcher.data?.status === 'error' && modalOpen && (fetcher.formData?.get('actionType') === 'create' || fetcher.formData?.get('actionType') === 'update') ? fetcher.data.errors?.priceValue : undefined}
                 />
                 <TextField
                   label="Description (Optional)"
