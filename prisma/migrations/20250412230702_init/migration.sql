@@ -1,4 +1,23 @@
 -- CreateTable
+CREATE TABLE "Session" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "shop" TEXT NOT NULL,
+    "state" TEXT NOT NULL,
+    "isOnline" BOOLEAN NOT NULL DEFAULT false,
+    "scope" TEXT,
+    "expires" DATETIME,
+    "accessToken" TEXT NOT NULL,
+    "userId" BIGINT,
+    "firstName" TEXT,
+    "lastName" TEXT,
+    "email" TEXT,
+    "accountOwner" BOOLEAN NOT NULL DEFAULT false,
+    "locale" TEXT,
+    "collaborator" BOOLEAN DEFAULT false,
+    "emailVerified" BOOLEAN DEFAULT false
+);
+
+-- CreateTable
 CREATE TABLE "WarrantyDefinition" (
     "id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
     "name" TEXT NOT NULL,
@@ -7,7 +26,10 @@ CREATE TABLE "WarrantyDefinition" (
     "priceValue" REAL NOT NULL,
     "description" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" DATETIME NOT NULL
+    "updatedAt" DATETIME NOT NULL,
+    "associationType" TEXT NOT NULL DEFAULT 'ALL_PRODUCTS',
+    "associatedProductIds" TEXT NOT NULL DEFAULT '[]',
+    "associatedCollectionIds" TEXT NOT NULL DEFAULT '[]'
 );
 
 -- CreateTable
