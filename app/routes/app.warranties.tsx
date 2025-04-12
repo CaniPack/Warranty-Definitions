@@ -1,559 +1,600 @@
 // app/routes/app.warranties.tsx
 
-import type { LoaderFunctionArgs, ActionFunctionArgs } from "@remix-run/node";
-import { json } from "@remix-run/node";
-import { useLoaderData, useFetcher } from "@remix-run/react";
+import { json, LoaderFunctionArgs, ActionFunctionArgs, TypedResponse, redirect } from "@remix-run/node";
+import {
+  useLoaderData,
+  useFetcher,
+  useNavigate,
+  // Form, // Removed as fetcher.Form is used
+} from "@remix-run/react";
+import { useState, useCallback, useEffect } from "react";
 import {
   Page, Card, Layout, BlockStack, Text, IndexTable, Button,
   Frame, Modal, FormLayout, TextField, Select, Banner,
-  Toast
+  Toast, InlineStack, ButtonGroup, EmptyState // Added ButtonGroup, EmptyState
 } from "@shopify/polaris";
 import prisma from "~/db.server"; // Import the Prisma client
-import type { WarrantyDefinition } from "@prisma/client"; // Usaremos este directamente
-import { useState, useEffect, useCallback } from "react"; // <-- Import useState, useEffect, useCallback
-// Import ONLY authenticate from shopify.server for this logic
-import { authenticate } from "~/shopify.server";
-// We are not using the custom session server anymore
-// import { getSession, commitSession } from "~/sessions.server";
-// Remove AppProvider and polarisStyles imports if they were added here by mistake, they belong in app.tsx
-// import { AppProvider } from "@shopify/shopify-app-remix/react";
-// import polarisStyles from "@shopify/polaris/build/esm/styles.css?url";
+// import { WarrantyDefinition, WarrantyAssociationType } from "@prisma/client"; // Re-added WarrantyAssociationType - Linter says it doesn't exist
+import { WarrantyDefinition } from "@prisma/client";
+// import { ResourcePicker, useAppBridge } from '@shopify/app-bridge-react'; // Re-added - Linter says ResourcePicker doesn't exist
+// import { useAppBridge } from '@shopify/app-bridge-react'; // Commented out as ResourcePicker is removed again
 
-// Loader: No changes needed, keep existing logic (without custom session)
-export const loader = async ({ request }: LoaderFunctionArgs) => {
+// --- Local Type Definitions ---
+
+// Define PriceType locally as it's not exported/found in @prisma/client
+enum PriceType {
+  FIXED_AMOUNT = 'FIXED_AMOUNT',
+  PERCENTAGE = 'PERCENTAGE',
+}
+
+// --- Type Definitions ---
+
+// Type for data loaded by the loader, adjusted for JSON serialization (Dates become strings)
+// Removed association fields again as they aren't in the schema
+interface WarrantyDefinitionFromLoader extends Omit<WarrantyDefinition, 'createdAt' | 'updatedAt' | 'priceType' | 'associationType' | 'associatedProductIds' | 'associatedCollectionIds'> {
+  createdAt: string;
+  updatedAt: string;
+  priceType: PriceType; // Use local enum
+  // associationType: WarrantyAssociationType; // Removed again
+  // associatedProductIds: string[]; // Removed again
+  // associatedCollectionIds: string[]; // Removed again
+}
+
+interface LoaderData {
+  warrantyDefinitions: WarrantyDefinitionFromLoader[];
+  successMessage?: string | null; // Optional success message from previous actions
+}
+
+// Action function return types
+interface ActionDataSuccess {
+  status: 'success';
+  message: string;
+  definition?: WarrantyDefinitionFromLoader; // Return the created/updated definition (serialized)
+  deletedId?: number; // Return the ID of the deleted definition
+}
+
+interface ActionDataError {
+  status: 'error';
+  message: string;
+  errors?: Record<string, string>; // Optional field-specific errors
+  fieldValues?: Record<string, any>; // Added back to repopulate form on error
+}
+
+type ActionData = ActionDataSuccess | ActionDataError;
+
+
+// Loader: Fetch warranty definitions
+export const loader = async ({ request }: LoaderFunctionArgs): Promise<TypedResponse<LoaderData>> => {
   console.log("🚨 SPARK LOADER START 🚨");
   try {
-    await authenticate.admin(request);
-    console.log("🚨 SPARK LOADER: Auth successful");
+    const url = new URL(request.url);
+    const successMessage = url.searchParams.get("successMessage");
 
-    const successMessage = null; // Keep flash message logic disabled for now
+    // Fetch definitions - removed association fields from select again
+    const definitionsDb = await prisma.warrantyDefinition.findMany({
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        name: true,
+        durationMonths: true,
+        priceType: true,
+        priceValue: true,
+        description: true,
+        createdAt: true,
+        updatedAt: true,
+        // associationType: true,         // Removed again
+        // associatedProductIds: true,    // Removed again
+        // associatedCollectionIds: true, // Removed again
+      }
+    });
 
-    if (!prisma) {
-      console.error("🚨 SPARK LOADER ERROR: Prisma client is not initialized!");
-      throw new Error("Database client not available");
-    }
+    // Manually map to ensure correct types for the frontend
+    const definitionsFrontend: WarrantyDefinitionFromLoader[] = definitionsDb.map(def => ({
+        ...def,
+        priceType: def.priceType as PriceType, // Cast to local enum
+        createdAt: def.createdAt.toISOString(),
+        updatedAt: def.updatedAt.toISOString(),
+        // No association fields to map
+    }));
 
-    const warrantyDefinitions = await prisma.warrantyDefinition.findMany({ orderBy: { createdAt: "desc" } });
-    console.log("🚨 SPARK LOADER: Definitions fetched:", warrantyDefinitions?.length);
 
-    // Return data for the page (successMessage can be added later if needed via fetcher)
-    return json({ warrantyDefinitions, successMessage: null });
+    return json({ warrantyDefinitions: definitionsFrontend, successMessage });
+
   } catch (error) {
     console.error("🚨 SPARK LOADER ERROR 🚨:", error);
-    throw error;
+    throw error; // Ensure a Response or Error is thrown
   }
 };
 
-// Action: Handles create, delete, and update
-export const action = async ({ request }: ActionFunctionArgs) => {
-  await authenticate.admin(request);
+
+// Action: Handle Create, Update, Delete
+export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResponse<ActionData>> => {
+  console.log("🚨 SPARK ACTION START 🚨");
   const formData = await request.formData();
-  const intent = formData.get("intent");
+  const actionType = formData.get("actionType");
+  const id = formData.get("id"); // Used for update/delete
 
-  if (intent === "create") {
-    // --- CREATE LOGIC ---
-    const name = formData.get("name") as string;
-    const durationMonthsStr = formData.get("durationMonths") as string;
-    const priceType = formData.get("priceType") as string;
-    const priceValueStr = formData.get("priceValue") as string;
-    const description = formData.get("description") as string | null;
-
-    const errors: Record<string, string> = {};
-    let durationMonths = NaN;
-    let priceValue = NaN;
-
-    // Validation
-    if (!name) errors.name = "Name is required.";
-    if (!durationMonthsStr) errors.durationMonths = "Duration is required.";
-    else {
-      durationMonths = parseInt(durationMonthsStr, 10);
-      if (isNaN(durationMonths) || durationMonths <= 0) {
-        errors.durationMonths = "Duration must be a positive number.";
+  try {
+    // --- Delete Action ---
+    if (actionType === "delete") {
+      if (!id) {
+        return json({ status: 'error', message: 'Missing ID for delete' }, { status: 400 });
+      }
+      try {
+        await prisma.warrantyDefinition.delete({ where: { id: Number(id) } });
+        console.log(`Deleted definition ${id}`);
+        // Return JSON success for fetcher.Form to handle state update
+        return json({ status: 'success', message: 'Warranty definition deleted successfully.', deletedId: Number(id) });
+        // Redirect was causing issues with fetcher state, switched to JSON response
+        // return redirect(`/app/warranties?successMessage=Warranty definition deleted successfully`);
+      } catch (error: any) {
+          if (error.code === 'P2025') {
+              console.error(`Attempted to delete non-existent definition ${id}`);
+              return json({ status: 'error', message: 'Warranty definition not found for deletion.' }, { status: 404 });
+          }
+          console.error("🚨 SPARK ACTION (Delete) ERROR 🚨:", error);
+          return json({ status: 'error', message: `Failed to delete definition: ${error.message || 'Unknown error'}` }, { status: 500 });
       }
     }
-    if (!priceType) errors.priceType = "Price type is required.";
-    else if (priceType !== "PERCENTAGE" && priceType !== "FIXED") {
-      errors.priceType = "Invalid price type selected.";
-    }
-    if (!priceValueStr) errors.priceValue = "Price value is required.";
-    else {
-       priceValue = parseFloat(priceValueStr);
-       if (isNaN(priceValue) || priceValue < 0) {
-           errors.priceValue = "Price value must be a non-negative number.";
-       }
-    }
 
-    // Return errors if validation fails
-    if (Object.keys(errors).length > 0) {
-       return json(
-         { status: 'error', errors, fieldValues: Object.fromEntries(formData) },
-         { status: 400 }
-       );
-    }
-
-    // Create in DB if valid
-    try {
-      const newDefinition = await prisma.warrantyDefinition.create({
-        data: { name, durationMonths, priceType, priceValue, description: description || null },
-      });
-      // Return different success structure including ID
-      return json({
-         status: 'success',
-         message: `Warranty definition "${newDefinition.name}" created successfully!`, 
-         newDefinitionId: newDefinition.id
-      });
-    } catch (error) {
-      console.error("Failed to create warranty definition:", error);
-      return json(
-         { status: 'error', errors: { form: "Failed to save warranty definition to the database." }, fieldValues: Object.fromEntries(formData) },
-         { status: 500 }
-       );
-    }
-    // --- END CREATE LOGIC ---
-  } else if (intent === "delete") {
-    // --- DELETE LOGIC ---
-    const idToDeleteStr = formData.get("id") as string; 
-    if (!idToDeleteStr) {
-      return json({ status: 'error', errors: { form: "Missing ID for deletion." } }, { status: 400 });
-    }
-    const idToDelete = parseInt(idToDeleteStr, 10);
-    if (isNaN(idToDelete)) {
-      return json({ status: 'error', errors: { form: "Invalid ID format." } }, { status: 400 });
-    }
-
-    try {
-      // Find the definition first to get its name
-      const definitionToDelete = await prisma.warrantyDefinition.findUnique({
-        where: { id: idToDelete },
-        select: { name: true } // Only select the name
-      });
-
-      if (!definitionToDelete) {
-        return json({ status: 'error', errors: { form: "Warranty definition not found." } }, { status: 404 });
-      }
-
-      // Now delete it
-      await prisma.warrantyDefinition.delete({ where: { id: idToDelete } });
-      
-      // Return success message with the name
-      return json({ 
-          status: 'success', 
-          message: `Warranty definition "${definitionToDelete.name}" deleted successfully.` 
-      });
-
-    } catch (error) {
-      console.error("Failed to delete warranty definition:", error);
-      return json(
-         { status: 'error', errors: { form: "Failed to delete warranty definition." } },
-         { status: 500 }
-       );
-    }
-    // --- END DELETE LOGIC ---
-  } else if (intent === "update") {
-    // --- UPDATE LOGIC ---
-    const idToUpdateStr = formData.get("id") as string;
+    // --- Create / Update Action ---
     const name = formData.get("name") as string;
-    const durationMonthsStr = formData.get("durationMonths") as string;
-    const priceType = formData.get("priceType") as string;
-    const priceValueStr = formData.get("priceValue") as string;
-    const description = formData.get("description") as string | null;
+    const durationMonths = formData.get("durationMonths") as string;
+    const priceType = formData.get("priceType") as PriceType; // Use local enum
+    const priceValue = formData.get("priceValue") as string;
+    const description = formData.get("description") as string;
+    // const associationType = formData.get("associationType") as WarrantyAssociationType; // Removed again
+    // const associatedProductIdsStr = formData.get("associatedProductIds") as string || '[]'; // Removed again
+    // const associatedCollectionIdsStr = formData.get("associatedCollectionIds") as string || '[]'; // Removed again
 
-    if (!idToUpdateStr) {
-        return json({ status: 'error', errors: { form: "Missing ID for update." } }, { status: 400 });
-    }
-    const idToUpdate = parseInt(idToUpdateStr, 10);
-     if (isNaN(idToUpdate)) {
-       return json({ status: 'error', errors: { form: "Invalid ID format for update." } }, { status: 400 });
-     }
-
+    // Basic Validation
     const errors: Record<string, string> = {};
-    let durationMonths = NaN;
-    let priceValue = NaN;
+    if (!name) errors.name = "Name is required";
+    if (!durationMonths || isNaN(parseInt(durationMonths, 10))) errors.durationMonths = "Duration must be a number";
+    if (!priceType || !Object.values(PriceType).includes(priceType)) errors.priceType = "Price type is required";
+    if (!priceValue || isNaN(parseFloat(priceValue))) errors.priceValue = "Price value must be a number";
+    // No association validation needed now
 
-    // Validation (same as create)
-    if (!name) errors.name = "Name is required.";
-    if (!durationMonthsStr) errors.durationMonths = "Duration is required.";
-    else {
-      durationMonths = parseInt(durationMonthsStr, 10);
-      if (isNaN(durationMonths) || durationMonths <= 0) errors.durationMonths = "Duration must be a positive number.";
-    }
-    if (!priceType) errors.priceType = "Price type is required.";
-    else if (priceType !== "PERCENTAGE" && priceType !== "FIXED") errors.priceType = "Invalid price type selected.";
-    if (!priceValueStr) errors.priceValue = "Price value is required.";
-    else {
-       priceValue = parseFloat(priceValueStr);
-       if (isNaN(priceValue) || priceValue < 0) errors.priceValue = "Price value must be a non-negative number.";
-    }
-
-    // Return errors if validation fails
     if (Object.keys(errors).length > 0) {
-       return json(
-         { status: 'error', errors, fieldValues: Object.fromEntries(formData) }, 
-         { status: 400 }
-       );
+      const fieldValues = Object.fromEntries(formData);
+      return json({ status: 'error', message: 'Validation failed', errors, fieldValues }, { status: 400 });
     }
 
-    // Update in DB if valid
-    try {
-      await prisma.warrantyDefinition.update({
-        where: { id: idToUpdate },
-        data: { name, durationMonths, priceType, priceValue, description: description || null },
+    // Prepare data for Prisma (convert types)
+    const dataToSave = {
+      name,
+      durationMonths: parseInt(durationMonths, 10),
+      priceType, // Save the string enum value
+      priceValue: priceType === PriceType.FIXED_AMOUNT
+                    ? Math.round(parseFloat(priceValue) * 100) // Convert dollars to cents
+                    : parseInt(priceValue, 10), // Percentage stored as integer (e.g., 10 for 10%)
+      description: description || null, // Handle empty description
+      // associationType: associationType, // Removed again
+      // associatedProductIds: associatedProductIds, // Removed again
+      // associatedCollectionIds: associatedCollectionIds, // Removed again
+    };
+
+    let savedDefinitionDb;
+    let successMessage: string;
+
+    if (actionType === "update" && id) {
+      // Update existing definition
+      savedDefinitionDb = await prisma.warrantyDefinition.update({
+        where: { id: Number(id) },
+        data: dataToSave,
       });
-      // Return success message for update
-      return json({ status: 'success', message: `Warranty definition "${name}" updated successfully!` });
-    } catch (error) {
-      console.error("Failed to update warranty definition:", error);
-      // Handle potential errors like record not found
-      // if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') { ... }
-      return json(
-         { status: 'error', errors: { form: "Failed to update warranty definition." }, fieldValues: Object.fromEntries(formData) },
-         { status: 500 }
-       );
+      successMessage = "Warranty definition updated successfully";
+      console.log(`Updated definition ${id}`);
+    } else {
+      // Create new definition
+      savedDefinitionDb = await prisma.warrantyDefinition.create({
+        data: dataToSave,
+      });
+      successMessage = "Warranty definition created successfully";
+      console.log(`Created new definition ${savedDefinitionDb.id}`);
     }
-    // --- END UPDATE LOGIC ---
+
+    // Manually construct the serialized version for the response
+    const responseDefinition: WarrantyDefinitionFromLoader = {
+        ...savedDefinitionDb,
+        priceType: savedDefinitionDb.priceType as PriceType, // Assert to local enum
+        createdAt: savedDefinitionDb.createdAt.toISOString(),
+        updatedAt: savedDefinitionDb.updatedAt.toISOString(),
+        // No association fields
+    };
+
+
+    // Return success state with the saved definition (serialized)
+    return json({ status: 'success', message: successMessage, definition: responseDefinition });
+
+  } catch (error: any) {
+    console.error("🚨 SPARK ACTION ERROR 🚨:", error);
+    if (error.code === 'P2002') {
+         return json({ status: 'error', message: 'A definition with similar key fields might already exist.' }, { status: 409 }); // Conflict
+    }
+    return json({ status: 'error', message: `Failed to ${actionType || 'save'} definition: ${error.message || 'Unknown error'}` }, { status: 500 });
   }
-
-  // Handle other intents
-  console.warn(`Unhandled intent: ${intent}`);
-  return json({ status: 'error', errors: { form: "Invalid operation requested." } }, { status: 400 });
 };
 
 
 // --- Frontend Component ---
 export default function WarrantyDefinitionsPage() {
-  const { warrantyDefinitions: loaderDefinitions } = useLoaderData<typeof loader>(); // Rename loader data
-  const fetcher = useFetcher<typeof action>();
+  // Use the adjusted type reflecting serialized data
+  const { warrantyDefinitions: initialWarrantyDefinitions, successMessage: initialSuccessMessage } = useLoaderData<LoaderData>();
 
-  // Restore Toast state
-  const [toastActive, setToastActive] = useState(false);
-  const [toastMessage, setToastMessage] = useState('');
-  const toggleToastActive = useCallback(() => setToastActive((active) => !active), []);
+  // State for the definitions displayed in the table - ensure type matches LoaderData
+  const [warrantyDefinitions, setWarrantyDefinitions] = useState<WarrantyDefinitionFromLoader[]>(initialWarrantyDefinitions);
+  // Local state for success message to allow dismissal
+  const [successMessage, setSuccessMessage] = useState<string | null>(initialSuccessMessage || null);
 
-  // --- State ---
+  const fetcher = useFetcher<ActionData>();
+  const navigate = useNavigate(); // For potential navigation/redirects
+  // const appBridge = useAppBridge(); // Removed again
+
+  // Form State (Create/Edit Modal)
   const [modalOpen, setModalOpen] = useState(false);
-  const [editingDefinition, setEditingDefinition] = useState<WarrantyDefinition | null>(null);
-
-  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
-  const [definitionIdToDelete, setDefinitionIdToDelete] = useState<number | null>(null);
-  // Correct handler to set the ID and open the modal
-  const handleOpenDeleteModal = useCallback((id: number) => {
-      setDefinitionIdToDelete(id);
-      setDeleteModalOpen(true);
-  }, []);
-  const handleCloseDeleteModal = useCallback(() => {
-      setDefinitionIdToDelete(null);
-      setDeleteModalOpen(false);
-  }, []);
-
+  const [editingId, setEditingId] = useState<number | null>(null);
   const [formState, setFormState] = useState({
-      name: '', durationMonths: '12', priceType: 'PERCENTAGE',
-      priceValue: '10', description: '',
+    name: '',
+    durationMonths: '',
+    priceType: PriceType.FIXED_AMOUNT, // Use local enum default
+    priceValue: '',
+    description: '',
+    // associationType: WarrantyAssociationType.ALL_PRODUCTS, // Removed again
   });
 
-  const handleFormChange = useCallback(
-       (value: string, field: keyof typeof formState) => {
-           setFormState((prev) => ({ ...prev, [field]: value }));
-       }, [],
-   );
+  // State for Delete Confirmation Modal (Added)
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [definitionIdToDelete, setDefinitionIdToDelete] = useState<number | null>(null);
 
-  // Handlers for opening/closing the modal
-  const handleOpenCreateModal = useCallback(() => {
-      setEditingDefinition(null); // Ensure we are in create mode
-      setFormState({ name: '', durationMonths: '12', priceType: 'PERCENTAGE', priceValue: '10', description: '' }); // Reset form
-      setModalOpen(true);
-  }, []);
+  // State for Resource Picker (Removed again)
+  // const [pickerOpen, setPickerOpen] = useState(false);
+  // const [selectedProductIds, setSelectedProductIds] = useState<string[]>([]);
+  // const [selectedCollectionIds, setSelectedCollectionIds] = useState<string[]>([]);
 
-  const handleOpenEditModal = useCallback((definition: WarrantyDefinition) => {
-      setEditingDefinition(definition); // Set the definition to edit
-      setFormState({
-          name: definition.name,
-          durationMonths: definition.durationMonths.toString(), 
-          priceType: definition.priceType,
-          priceValue: definition.priceValue.toString(), 
-          description: definition.description || '',
-      });
-      setModalOpen(true);
-  }, []);
 
-  const handleCloseModal = useCallback(() => {
-      setModalOpen(false);
-      setEditingDefinition(null); // Clear editing state on close
-  }, []);
-
-  // Type warrantyDefinitions explicitly after loader using double assertion
-  const warrantyDefinitions = loaderDefinitions as unknown as WarrantyDefinition[];
-  
-  // Handle fetcher completion
+  // Effect to update table/state after successful CUD operations via fetcher
   useEffect(() => {
-    if (fetcher.state === 'idle' && fetcher.data) {
-        const data = fetcher.data;
+    if (fetcher.data && fetcher.state === 'idle') {
+      const data = fetcher.data; // Type guard for ActionData
+      if (data.status === 'success') {
+        console.log("Action successful:", data.message);
+        setSuccessMessage(data.message); // Show success banner
 
-        if (typeof data === 'object' && data !== null && data.status === 'success') {
-          const successData = data as { message: string }; 
-          handleCloseModal(); 
-          if (deleteModalOpen) handleCloseDeleteModal();
-          setToastMessage(successData.message);
-          setToastActive(true);
-        } 
-        else if (typeof data === 'object' && data !== null && data.status === 'error') {
-          const errorData = data as { fieldValues?: any; errors?: Record<string, string> | { form: string } }; 
-          // Repopulate form only if fieldValues exists (error during create/update)
-          if (modalOpen && errorData.fieldValues) {
-             const values = errorData.fieldValues; 
+        // Handle Create/Update success
+        if (data.definition) {
+          const updatedDefinition = data.definition;
+          setWarrantyDefinitions(prev => {
+            const index = prev.findIndex(def => def.id === updatedDefinition.id);
+            if (index > -1) {
+               const newState = [...prev];
+               newState[index] = updatedDefinition;
+               return newState;
+            } else {
+              return [updatedDefinition, ...prev];
+            }
+          });
+           handleCloseModal(); // Close create/edit modal on success
+        }
+        // Handle Delete success (now that it returns JSON)
+        else if (data.deletedId) {
+            const deletedId = data.deletedId;
+             setWarrantyDefinitions(prev => prev.filter(def => def.id !== deletedId));
+             handleCloseDeleteModal(); // Close delete confirmation modal on success
+        }
+
+        // handleCloseModal(); // Moved into specific success cases above
+
+      } else if (data.status === 'error') {
+        console.error("Action failed:", data.message);
+        // Repopulate form state if fieldValues were returned on validation error (for create/edit modal)
+        if (modalOpen && data.errors && data.fieldValues) {
+            const values = data.fieldValues as typeof formState;
              setFormState({
                  name: values.name || '',
-                 durationMonths: values.durationMonths || '12',
-                 priceType: values.priceType || 'PERCENTAGE',
-                 priceValue: values.priceValue || '10',
+                 durationMonths: values.durationMonths || '',
+                 priceType: (Object.values(PriceType).includes(values.priceType as PriceType) ? values.priceType : PriceType.FIXED_AMOUNT) as PriceType,
+                 priceValue: values.priceValue || '',
                  description: values.description || '',
+                 // associationType: values.associationType, // Removed again
              });
-          }
-          // Show form-level error toast 
-          if (errorData.errors && 'form' in errorData.errors) { 
-              setToastMessage(errorData.errors.form);
-              setToastActive(true);
-          }
+             // No need to repopulate picker IDs
         }
+        // If the error was during delete, keep delete modal open to show error? Currently handled by Banner.
+      }
     }
-  }, [fetcher.state, fetcher.data, handleCloseModal, handleCloseDeleteModal, modalOpen, deleteModalOpen]);
+  }, [fetcher.state, fetcher.data]); // Dependency array includes fetcher.data
 
-  // Extract errors safely based on fetcher state and data structure
-  let currentErrors: Record<string, string> | { form: string } | null = null;
-  if (fetcher.state === 'idle' && fetcher.data && typeof fetcher.data === 'object' && fetcher.data.status === 'error' && 'errors' in fetcher.data) {
-      currentErrors = fetcher.data.errors as Record<string, string> | { form: string };
-  }
-                 
-  const fieldErrors = (currentErrors && !('form' in currentErrors)) ? currentErrors as Record<string, string> : null;
-  const generalFormError = (currentErrors && 'form' in currentErrors) ? currentErrors.form : null;
+  // Updated handleInputChange to exclude removed fields
+  const handleInputChange = useCallback((value: string, field: keyof Omit<typeof formState, 'priceType'>) => {
+    setFormState(prev => ({ ...prev, [field]: value }));
+  }, []);
 
-  const resourceName = {
-    singular: 'warranty definition',
-    plural: 'warranty definitions',
+  // Simplified handleSelectChange for PriceType only
+  const handleSelectChange = useCallback((value: PriceType, field: 'priceType') => {
+      setFormState(prev => ({ ...prev, [field]: value }));
+  }, []);
+
+
+  const handleOpenModalForCreate = () => {
+    setEditingId(null);
+    setFormState({ // Reset form
+      name: '',
+      durationMonths: '',
+      priceType: PriceType.FIXED_AMOUNT, // Use local enum
+      priceValue: '',
+      description: '',
+      // associationType: WarrantyAssociationType.ALL_PRODUCTS, // Removed again
+    });
+    // No picker IDs to reset
+    setModalOpen(true);
   };
 
-  // Create/Edit Modal Markup (replaces createModalMarkup)
-  const formModalMarkup = (
-      <Modal
-          open={modalOpen} // Use single state
-          onClose={handleCloseModal} // Use single handler
-          title={editingDefinition ? "Edit Warranty Definition" : "Create New Warranty Definition"} // Dynamic title
-          primaryAction={{
-              content: 'Save',
-              onAction: () => {
-                  const form = document.getElementById('warranty-form'); // Use consistent ID
-                  if (form instanceof HTMLFormElement) { fetcher.submit(form); }
-              },
-              loading: fetcher.state !== 'idle' && (fetcher.formData?.get('intent') === 'create' || fetcher.formData?.get('intent') === 'update'),
-          }}
-          secondaryActions={[
-              { content: 'Cancel', onAction: handleCloseModal, disabled: fetcher.state !== 'idle' },
-          ]}
-      >
-          <Modal.Section>
-              {/* Use the same form ID */}
-              <fetcher.Form method="post" id="warranty-form"> 
-                  {/* Dynamic intent and optional ID */}
-                  <input type="hidden" name="intent" value={editingDefinition ? "update" : "create"} />
-                  {editingDefinition && (
-                      <input type="hidden" name="id" value={editingDefinition.id} />
-                  )}
-                  <FormLayout>
-                      {generalFormError && (
-                           <Banner title="Error saving definition" tone="critical">
-                               <p>{generalFormError}</p>
-                           </Banner>
-                       )}
-                       <TextField
-                           label="Name"
-                           name="name"
-                           value={formState.name}
-                           onChange={(value) => handleFormChange(value, 'name')}
-                           autoComplete="off"
-                           requiredIndicator
-                           helpText="A descriptive name (e.g., '12-Month Electronics Warranty')."
-                           error={fieldErrors?.name}
-                       />
-                       <TextField
-                           label="Duration (Months)"
-                           name="durationMonths"
-                           type="number"
-                           value={formState.durationMonths}
-                           onChange={(value) => handleFormChange(value, 'durationMonths')}
-                           autoComplete="off"
-                           requiredIndicator
-                           min={1}
-                           error={fieldErrors?.durationMonths}
-                       />
-                      <Select
-                          label="Price Type"
-                          name="priceType"
-                          options={[
-                              { label: 'Percentage of Product Price', value: 'PERCENTAGE' },
-                              { label: 'Fixed Amount', value: 'FIXED' },
-                          ]}
-                          value={formState.priceType}
-                          onChange={(value) => handleFormChange(value, 'priceType')}
-                          requiredIndicator
-                          error={fieldErrors?.priceType}
-                      />
-                       <TextField
-                           label={formState.priceType === 'PERCENTAGE' ? 'Percentage Value (%)' : 'Fixed Price ($)'}
-                           name="priceValue"
-                           type="number"
-                           step={0.01}
-                           value={formState.priceValue}
-                           onChange={(value) => handleFormChange(value, 'priceValue')}
-                           autoComplete="off"
-                           requiredIndicator
-                           min={0}
-                           prefix={formState.priceType === 'FIXED' ? '$' : undefined}
-                           suffix={formState.priceType === 'PERCENTAGE' ? '%' : undefined}
-                           error={fieldErrors?.priceValue}
-                       />
-                        <TextField
-                            label="Description (Optional)"
-                            name="description"
-                            value={formState.description}
-                            onChange={(value) => handleFormChange(value, 'description')}
-                            autoComplete="off"
-                            multiline={3}
-                        />
-                   </FormLayout>
-              </fetcher.Form>
-          </Modal.Section>
-      </Modal>
-  );
+  const handleEdit = (definition: WarrantyDefinitionFromLoader) => { // Use adjusted type
+    setEditingId(definition.id);
+    setFormState({
+        name: definition.name,
+        durationMonths: definition.durationMonths.toString(), // Convert number to string for input
+        priceType: definition.priceType, // Use local enum
+        priceValue: definition.priceType === PriceType.FIXED_AMOUNT
+                      ? (definition.priceValue / 100).toFixed(2)
+                      : definition.priceValue.toString(),
+        description: definition.description || '',
+        // associationType: definition.associationType, // Removed again
+    });
+    // No picker IDs to set
+    setModalOpen(true);
+  };
 
-  // Restore toastMarkup variable (ignoring linter error for tone)
-  const toastMarkup = toastActive ? (
-    <Toast 
-      content={toastMessage} 
-      onDismiss={toggleToastActive} 
-      tone="success" 
-      duration={90000}
-    />
-  ) : null;
+  const handleCloseModal = () => {
+    setModalOpen(false);
+    setEditingId(null);
+    // Optionally clear fetcher errors when closing manually
+    if (fetcher.data?.status === 'error') {
+        // Might want to clear fetcher.data here if errors persist visually
+    }
+  };
 
-  // Delete Confirmation Modal Markup
-  const deleteModalMarkup = (
-      <Modal
-          open={deleteModalOpen}
-          onClose={handleCloseDeleteModal}
-          title="Delete Warranty Definition?"
-          primaryAction={{
-              content: 'Delete',
-              destructive: true,
-              onAction: () => {
-                  if (definitionIdToDelete !== null) {
-                     const formData = new FormData();
-                     formData.append('intent', 'delete');
-                     formData.append('id', definitionIdToDelete.toString());
-                     fetcher.submit(formData, { method: 'post' });
-                  }
-              },
-              loading: fetcher.state !== 'idle',
-          }}
-          secondaryActions={[
-              {
-                  content: 'Cancel',
-                  onAction: handleCloseDeleteModal,
-                  disabled: fetcher.state !== 'idle',
-              },
-          ]}
-      >
-          <Modal.Section>
-              <Text as="p">
-                  Are you sure you want to delete this warranty definition? This action cannot be undone.
-              </Text>
-          </Modal.Section>
-      </Modal>
-  );
+  // Handlers for Delete Confirmation Modal (Added)
+  const handleOpenDeleteModal = useCallback((id: number) => {
+    setDefinitionIdToDelete(id);
+    setDeleteModalOpen(true);
+  }, []);
 
+  const handleCloseDeleteModal = useCallback(() => {
+    setDefinitionIdToDelete(null);
+    setDeleteModalOpen(false);
+  }, []);
+
+  const handleDeleteDefinition = useCallback(() => {
+    if (definitionIdToDelete !== null) {
+        const formData = new FormData();
+        formData.append('actionType', 'delete');
+        formData.append('id', String(definitionIdToDelete));
+        fetcher.submit(formData, { method: 'post' });
+        // Modal will be closed via useEffect on successful fetcher.data update
+    }
+  }, [definitionIdToDelete, fetcher]);
+
+
+  // Resource Picker Logic (Removed again)
+  // const handleOpenPicker = (selectsCollections: boolean) => { ... };
+  // const handleResourceSelection = (selectPayload: any) => { ... };
+
+  // --- JSX Render ---
   return (
-    <Frame>
-      <Page fullWidth title="Warranty Definitions">
-        <Layout>
-          <Layout.Section>
-            <Card>
-              <BlockStack gap="400">
-                 <BlockStack gap="200">
-                  <Text variant="headingMd" as="h2">
-                      Manage Warranty Templates
+    <Page
+        title="Warranty Definitions"
+        primaryAction={{ content: 'Create Definition', onAction: handleOpenModalForCreate }}
+    >
+      <Frame> {/* Frame is needed for Toasts and potentially Modals */}
+        <BlockStack gap="500">
+          {/* Display Success/Error Banner */}
+          {successMessage && (
+              <Banner title="Success" tone="success" onDismiss={() => setSuccessMessage(null)}>
+                  <p>{successMessage}</p>
+              </Banner>
+          )}
+          {fetcher.data?.status === 'error' && fetcher.state === 'idle' && (
+              <Banner
+                  title="Error"
+                  tone='critical'
+                  // Keep error banner visible until next action or manual dismiss
+                  // onDismiss={() => { /* Optionally clear fetcher state or local error state */ }}
+              >
+                  <p>{fetcher.data.message}</p>
+                  {/* Display field-specific errors if they exist */}
+                  {fetcher.data.errors && (
+                    <BlockStack gap="100">
+                        {Object.entries(fetcher.data.errors).map(([field, message]) => (
+                            <Text key={field} as="p" tone="critical">&#8226; {message}</Text>
+                        ))}
+                    </BlockStack>
+                  )}
+              </Banner>
+          )}
+
+          {/* Resource Picker Component (Removed again) */}
+           {/* {pickerOpen && ( ... )} */}
+
+          {/* Modal for Create/Edit */}
+          <Modal
+            open={modalOpen}
+            onClose={handleCloseModal}
+            title={editingId ? "Edit Warranty Definition" : "Create Warranty Definition"}
+            primaryAction={{
+              content: editingId ? 'Save Changes' : 'Create Definition',
+              onAction: () => {
+                // Submit the form data using the fetcher
+                const formData = new FormData();
+                formData.append('actionType', editingId ? 'update' : 'create');
+                if (editingId) {
+                  formData.append('id', String(editingId));
+                }
+                formData.append('name', formState.name);
+                formData.append('durationMonths', formState.durationMonths);
+                formData.append('priceType', formState.priceType); // Send local enum string value
+                formData.append('priceValue', formState.priceValue);
+                formData.append('description', formState.description);
+                // No association data to append
+
+                fetcher.submit(formData, { method: 'post' });
+              },
+              loading: fetcher.state === 'submitting' || fetcher.state === 'loading',
+              disabled: fetcher.state !== 'idle',
+            }}
+            secondaryActions={[{ content: 'Cancel', onAction: handleCloseModal }]}
+          >
+            <Modal.Section>
+              <FormLayout>
+                <TextField
+                  label="Warranty Name"
+                  value={formState.name}
+                  onChange={(value) => handleInputChange(value, 'name')}
+                  autoComplete="off"
+                  requiredIndicator
+                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.name : undefined}
+                />
+                 <TextField
+                  label="Duration (Months)"
+                  type="number"
+                  value={formState.durationMonths}
+                  onChange={(value) => handleInputChange(value, 'durationMonths')}
+                  autoComplete="off"
+                  requiredIndicator
+                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.durationMonths : undefined}
+                />
+                 <Select
+                  label="Price Type"
+                  options={[
+                    { label: 'Fixed Amount ($)', value: PriceType.FIXED_AMOUNT },
+                    { label: 'Percentage (%)', value: PriceType.PERCENTAGE },
+                  ]}
+                  value={formState.priceType} // Use local enum state
+                  onChange={(value) => handleSelectChange(value as PriceType, 'priceType')} // Use local enum
+                  requiredIndicator
+                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.priceType : undefined}
+                />
+                 <TextField
+                  label={formState.priceType === PriceType.FIXED_AMOUNT ? "Price ($)" : "Price (%)"} // Use local enum
+                  type="number"
+                  prefix={formState.priceType === PriceType.FIXED_AMOUNT ? '$' : undefined} // Use local enum
+                  suffix={formState.priceType === PriceType.PERCENTAGE ? '%' : undefined} // Use local enum
+                  value={formState.priceValue}
+                  onChange={(value) => handleInputChange(value, 'priceValue')}
+                  autoComplete="off"
+                  requiredIndicator
+                  step={formState.priceType === PriceType.FIXED_AMOUNT ? 0.01 : 1} // Use local enum & numeric step
+                  min="0"
+                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.priceValue : undefined}
+                />
+                <TextField
+                  label="Description (Optional)"
+                  value={formState.description}
+                  onChange={(value) => handleInputChange(value, 'description')}
+                  autoComplete="off"
+                  multiline={3}
+                />
+
+                {/* Association Type Selector (Removed again) */}
+                {/* <Select ... /> */}
+
+                {/* Conditional UI for Specific Products/Collections (Removed again) */}
+                 {/* {formState.associationType === ... && ( ... )} */}
+
+              </FormLayout>
+            </Modal.Section>
+          </Modal>
+
+          {/* Delete Confirmation Modal (Added) */}
+          <Modal
+              open={deleteModalOpen}
+              onClose={handleCloseDeleteModal}
+              title="Delete Warranty Definition?"
+              primaryAction={{
+                  content: 'Delete',
+                  destructive: true,
+                  onAction: handleDeleteDefinition,
+                  loading: fetcher.state !== 'idle' && fetcher.formData?.get('actionType') === 'delete',
+                  disabled: fetcher.state !== 'idle',
+              }}
+              secondaryActions={[
+                  {
+                      content: 'Cancel',
+                      onAction: handleCloseDeleteModal,
+                      disabled: fetcher.state !== 'idle',
+                  },
+              ]}
+          >
+              <Modal.Section>
+                  <Text as="p">
+                      Are you sure you want to delete this warranty definition? This action cannot be undone.
                   </Text>
-                  <Text variant="bodyMd" as="p" tone="subdued">
-                      Define the basic rules for your extended warranties (duration, price calculation). You can later assign these definitions to specific products or collections.
-                  </Text>
-                 </BlockStack>
-                 <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                   <Button
-                     variant="primary"
-                     onClick={handleOpenCreateModal}
-                   >
-                     Create Warranty Definition
-                   </Button>
-                 </div>
-                   <IndexTable
-                     resourceName={resourceName}
-                     itemCount={warrantyDefinitions.length}
-                     headings={[
-                       { title: 'Name' },
-                       { title: 'Duration' },
-                       { title: 'Price Rule' },
-                       { title: 'Description' },
-                       { title: 'Actions' }, // Placeholder for buttons
-                     ]}
-                     selectable={false}
-                   >
-                     {warrantyDefinitions.map((definition, index) => (
-                       <IndexTable.Row
-                         id={definition.id.toString()}
-                         key={definition.id}
-                         position={index}
-                       >
-                         <IndexTable.Cell>{definition.name ?? 'N/A'}</IndexTable.Cell>
-                         <IndexTable.Cell>{definition.durationMonths ?? '?'} months</IndexTable.Cell>
-                         <IndexTable.Cell>
-                           {definition.priceType === 'PERCENTAGE'
-                             ? `${parseFloat(definition.priceValue?.toString() ?? '0').toFixed(1)}% of product price`
-                             : `$${parseFloat(definition.priceValue?.toString() ?? '0').toFixed(2)} fixed`}
-                         </IndexTable.Cell>
-                         <IndexTable.Cell>{definition.description || '—'}</IndexTable.Cell>
-                          <IndexTable.Cell>
-                            <BlockStack inlineAlign="start" gap="100">
-                                <Button 
-                                  size="slim" 
-                                  onClick={() => handleOpenEditModal(definition as unknown as WarrantyDefinition)}
-                                  disabled={fetcher.state !== 'idle'} 
-                               >Edit</Button>
-                                <Button 
-                                  size="slim" 
-                                  variant="tertiary" 
-                                  tone="critical"
-                                  onClick={() => handleOpenDeleteModal(definition.id)}
-                                  disabled={fetcher.state !== 'idle'}
-                                 >
-                                   Delete
-                                 </Button>
-                            </BlockStack>
-                         </IndexTable.Cell>
-                       </IndexTable.Row>
-                     ))}
-                   </IndexTable>
-                   {warrantyDefinitions.length === 0 && (
-                     <div style={{ padding: 'var(--p-space-400)', textAlign: 'center' }}> {/* Use Polaris spacing token */}
-                       <Text variant="bodyMd" as="p" tone="subdued">
-                         No warranty definitions created yet. Click "Create Warranty Definition" to get started.
-                       </Text>
-                     </div>
-                   )}
-               </BlockStack>
-            </Card>
-          </Layout.Section>
-        </Layout>
-        {toastMarkup}
-        {formModalMarkup}
-        {deleteModalMarkup}
-      </Page>
-    </Frame>
+              </Modal.Section>
+          </Modal>
+
+          {/* Warranty Definitions Table */}
+          <Card padding="0">
+              {warrantyDefinitions.length > 0 ? (
+                  <IndexTable
+                      itemCount={warrantyDefinitions.length}
+                      headings={[
+                          { title: 'Name' },
+                          { title: 'Duration' },
+                          { title: 'Price' },
+                          // { title: 'Applies To' }, // Removed again
+                          { title: 'Actions' },
+                      ]}
+                      selectable={false}
+                  >
+                      {warrantyDefinitions.map((definition, index) => (
+                        <IndexTable.Row id={String(definition.id)} key={definition.id} position={index}>
+                            <IndexTable.Cell>{definition.name}</IndexTable.Cell>
+                            <IndexTable.Cell>{definition.durationMonths} months</IndexTable.Cell>
+                            <IndexTable.Cell>
+                                {definition.priceType === PriceType.FIXED_AMOUNT
+                                    ? `$${(definition.priceValue / 100).toFixed(2)}` // Display as dollars
+                                    : `${definition.priceValue}%`}
+                            </IndexTable.Cell>
+                             {/* <IndexTable.Cell> ... </IndexTable.Cell> */}
+                            <IndexTable.Cell>
+                              <ButtonGroup>
+                                  <Button onClick={() => handleEdit(definition)}>Edit</Button>
+                                  {/* Updated Delete Button to open confirmation modal */}
+                                  <Button
+                                      variant="primary"
+                                      tone="critical"
+                                      onClick={() => handleOpenDeleteModal(definition.id)}
+                                      disabled={fetcher.state !== 'idle'}
+                                  >
+                                      Delete
+                                  </Button>
+                                  {/* Old fetcher.Form removed
+                                  <fetcher.Form method="post" style={{ display: 'inline-block' }}>
+                                      <input type="hidden" name="actionType" value="delete" />
+                                      <input type="hidden" name="id" value={definition.id} />
+                                      <Button submit variant="primary" tone="critical" disabled={fetcher.state !== 'idle'}>Delete</Button>
+                                   </fetcher.Form>
+                                  */}
+                              </ButtonGroup>
+                            </IndexTable.Cell>
+                        </IndexTable.Row>
+                      ))}
+                  </IndexTable>
+              ) : (
+                <EmptyState
+                  heading="No warranty definitions yet"
+                  action={{ content: 'Create Definition', onAction: handleOpenModalForCreate }}
+                  image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
+                >
+                  <p>Create your first warranty definition to offer extended warranties.</p>
+                </EmptyState>
+              )}
+          </Card>
+        </BlockStack>
+      </Frame>
+    </Page>
   );
-} 
+}
+
+// Helper function formatAssociationType removed 
