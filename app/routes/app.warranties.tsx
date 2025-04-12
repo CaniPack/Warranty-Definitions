@@ -1,24 +1,22 @@
 // app/routes/app.warranties.tsx
 
-import { json, LoaderFunctionArgs, ActionFunctionArgs, TypedResponse, redirect } from "@remix-run/node";
+import { json, LoaderFunctionArgs, ActionFunctionArgs, TypedResponse } from "@remix-run/node";
 import {
   useLoaderData,
   useFetcher,
-  useNavigate,
-  // Form, // Removed as fetcher.Form is used
+  // useNavigate, // Removed useNavigate as it's unused now
 } from "@remix-run/react";
 import { useState, useCallback, useEffect, useRef } from "react";
 import {
   Page, Card, Layout, BlockStack, Text, IndexTable, Button,
   Frame, Modal, FormLayout, TextField, Select, Banner,
-  Toast, InlineStack, ButtonGroup, EmptyState // Added ButtonGroup, EmptyState
+  InlineStack, ButtonGroup, EmptyState // Removed Toast as it's unused
 } from "@shopify/polaris";
 import prisma from "~/db.server"; // Import the Prisma client
-// import { WarrantyDefinition, WarrantyAssociationType } from "@prisma/client"; // Re-added WarrantyAssociationType - Linter says it doesn't exist
 import { WarrantyDefinition } from "@prisma/client";
 // import { ResourcePicker, useAppBridge } from '@shopify/app-bridge-react'; // Re-added - Linter says ResourcePicker doesn't exist
 // import { useAppBridge } from '@shopify/app-bridge-react'; // Commented out as ResourcePicker is removed again
-import { getSession, commitSession } from "../sessions.server"; // Import session functions
+// import { getSession, commitSession } from "../sessions.server"; // Removed session functions
 
 // --- Local Type Definitions ---
 
@@ -43,37 +41,34 @@ interface WarrantyDefinitionFromLoader extends Omit<WarrantyDefinition, 'created
 
 interface LoaderData {
   warrantyDefinitions: WarrantyDefinitionFromLoader[];
-  successMessage?: string | null; // Message from session flash
+  // No success message from loader
 }
 
-// Action function return types
+// Action function return types - All actions return JSON
 interface ActionDataSuccess {
   status: 'success';
-  // No longer returning definition/id directly on success, redirecting instead
-  message?: string; // Can keep for consistency but won't be used if redirecting
-  deletedId?: number;
+  message: string;
+  definition?: WarrantyDefinitionFromLoader; // For create/update
+  deletedId?: number; // For delete
 }
 
 interface ActionDataError {
   status: 'error';
   message: string;
-  errors?: Record<string, string>; // Optional field-specific errors
-  fieldValues?: Record<string, any>; // Added back to repopulate form on error
+  errors?: Record<string, string>;
+  fieldValues?: Record<string, any>;
 }
 
-type ActionData = ActionDataSuccess | ActionDataError; // Success type is less relevant now
+type ActionData = ActionDataSuccess | ActionDataError;
 
 
-// Loader: Fetch warranty definitions and read flash message
+// Loader: Fetch warranty definitions ONLY
 export const loader = async ({ request }: LoaderFunctionArgs): Promise<TypedResponse<LoaderData>> => {
   console.log("🚨 SPARK LOADER START 🚨");
 
-  // Get session and potential flash message
-  const session = await getSession(request.headers.get("Cookie"));
-  const successMessage = session.get("successMessage") as string | null || null; // Read flash message
+  // Removed session logic
 
   try {
-    // Fetch definitions - removed association fields from select again
     const definitionsDb = await prisma.warrantyDefinition.findMany({
       orderBy: { createdAt: 'desc' },
       select: {
@@ -85,43 +80,33 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<TypedResp
         description: true,
         createdAt: true,
         updatedAt: true,
-        // associationType: true,         // Removed again
-        // associatedProductIds: true,    // Removed again
-        // associatedCollectionIds: true, // Removed again
       }
     });
 
-    // Manually map to ensure correct types for the frontend
     const definitionsFrontend: WarrantyDefinitionFromLoader[] = definitionsDb.map(def => ({
         ...def,
-        priceType: def.priceType as PriceType, // Cast to local enum
+        priceType: def.priceType as PriceType,
         createdAt: def.createdAt.toISOString(),
         updatedAt: def.updatedAt.toISOString(),
-        // No association fields to map
     }));
 
-    // Return data and commit session (to clear flash message from cookie)
-    return json(
-        { warrantyDefinitions: definitionsFrontend, successMessage },
-        { headers: { "Set-Cookie": await commitSession(session) } }
-    );
+    // Return only definitions
+    return json({ warrantyDefinitions: definitionsFrontend });
 
   } catch (error) {
     console.error("🚨 SPARK LOADER ERROR 🚨:", error);
-    // Commit session even on error? Might depend on desired behavior.
-    // For now, just rethrow, session commit won't happen.
-    throw error; // Ensure a Response or Error is thrown
+    throw error;
   }
 };
 
 
-// Action: Handle Create, Update, Delete and set flash message on success
-export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResponse<ActionData> | Response> => {
+// Action: Handle Create, Update, Delete and return JSON response
+export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResponse<ActionData>> => {
   console.log("🚨 SPARK ACTION START 🚨");
-  const session = await getSession(request.headers.get("Cookie"));
+  // Removed session logic
   const formData = await request.formData();
   const actionType = formData.get("actionType");
-  const id = formData.get("id"); // Used for update/delete
+  const id = formData.get("id");
 
   try {
     // --- Delete Action ---
@@ -132,13 +117,8 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResp
       try {
         await prisma.warrantyDefinition.delete({ where: { id: Number(id) } });
         console.log(`Deleted definition ${id}`);
-        // Return JSON success for fetcher to handle UI update immediately
+        // Return JSON success for fetcher
         return json({ status: 'success', message: 'Warranty definition deleted successfully.', deletedId: Number(id) });
-        // // Set flash message and redirect (Removed - Causes delayed UI update)
-        // session.flash("successMessage", "Warranty definition deleted successfully.");
-        // return redirect("/app/warranties", {
-        //     headers: { "Set-Cookie": await commitSession(session) }
-        // });
       } catch (error: any) {
           if (error.code === 'P2025') {
               console.error(`Attempted to delete non-existent definition ${id}`);
@@ -152,7 +132,7 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResp
     // --- Create / Update Action ---
     const name = formData.get("name") as string;
     const durationMonths = formData.get("durationMonths") as string;
-    const priceType = formData.get("priceType") as PriceType; // Use local enum
+    const priceType = formData.get("priceType") as PriceType;
     const priceValue = formData.get("priceValue") as string;
     const description = formData.get("description") as string;
     // const associationType = formData.get("associationType") as WarrantyAssociationType; // Removed again
@@ -169,29 +149,29 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResp
 
     if (Object.keys(errors).length > 0) {
       const fieldValues = Object.fromEntries(formData);
-      // Return validation errors for fetcher to handle
       return json({ status: 'error', message: 'Validation failed', errors, fieldValues }, { status: 400 });
     }
 
-    // Prepare data for Prisma (convert types)
+    // Prepare data for Prisma
     const dataToSave = {
       name,
       durationMonths: parseInt(durationMonths, 10),
-      priceType, // Save the string enum value
+      priceType,
       priceValue: priceType === PriceType.FIXED_AMOUNT
-                    ? Math.round(parseFloat(priceValue) * 100) // Convert dollars to cents
-                    : parseInt(priceValue, 10), // Percentage stored as integer (e.g., 10 for 10%)
-      description: description || null, // Handle empty description
+                    ? Math.round(parseFloat(priceValue) * 100)
+                    : parseInt(priceValue, 10),
+      description: description || null,
       // associationType: associationType, // Removed again
       // associatedProductIds: associatedProductIds, // Removed again
       // associatedCollectionIds: associatedCollectionIds, // Removed again
     };
 
+    let savedDefinitionDb;
     let successMessage: string;
 
     if (actionType === "update" && id) {
       // Update existing definition
-      await prisma.warrantyDefinition.update({
+      savedDefinitionDb = await prisma.warrantyDefinition.update({
         where: { id: Number(id) },
         data: dataToSave,
       });
@@ -199,29 +179,32 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResp
       console.log(`Updated definition ${id}`);
     } else {
       // Create new definition
-      const newDef = await prisma.warrantyDefinition.create({
+      savedDefinitionDb = await prisma.warrantyDefinition.create({
         data: dataToSave,
       });
       successMessage = "Warranty definition created successfully";
-      console.log(`Created new definition ${newDef.id}`);
+      console.log(`Created new definition ${savedDefinitionDb.id}`);
     }
 
-    // Set flash message and redirect *only for create/update*
-    session.flash("successMessage", successMessage);
-    return redirect("/app/warranties", {
-        headers: { "Set-Cookie": await commitSession(session) }
-    });
+    // Manually construct the serialized version for the response
+    const responseDefinition: WarrantyDefinitionFromLoader = {
+        ...savedDefinitionDb,
+        priceType: savedDefinitionDb.priceType as PriceType,
+        createdAt: savedDefinitionDb.createdAt.toISOString(),
+        updatedAt: savedDefinitionDb.updatedAt.toISOString(),
+    };
+
+    // Return JSON success for fetcher
+    return json({ status: 'success', message: successMessage, definition: responseDefinition });
 
   } catch (error: any) {
     console.error("🚨 SPARK ACTION ERROR 🚨:", error);
-    // Handle generic errors (like unique constraints P2002)
     let errorMessage = `Failed to ${actionType || 'save'} definition: ${error.message || 'Unknown error'}`;
     let status = 500;
     if (error.code === 'P2002') {
         errorMessage = 'A definition with similar key fields might already exist.';
-        status = 409; // Conflict
+        status = 409;
     }
-    // Return JSON error for fetcher
     return json({ status: 'error', message: errorMessage }, { status });
   }
 };
@@ -229,18 +212,17 @@ export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResp
 
 // --- Frontend Component ---
 export default function WarrantyDefinitionsPage() {
-  // Read loader data, including potential flash message
-  const { warrantyDefinitions: initialWarrantyDefinitions, successMessage: initialSuccessMessage } = useLoaderData<LoaderData>();
+  // Read loader data (only definitions now)
+  const { warrantyDefinitions: initialWarrantyDefinitions } = useLoaderData<LoaderData>();
 
-  // State for the definitions (updated by page loads)
+  // State for definitions
   const [warrantyDefinitions, setWarrantyDefinitions] = useState<WarrantyDefinitionFromLoader[]>(initialWarrantyDefinitions);
-  // Local state for success message (initialized from loader flash message)
-  const [successMessage, setSuccessMessage] = useState<string | null>(initialSuccessMessage || null);
-  // Ref for the auto-dismiss timeout
+  // Local state for success message (set by fetcher)
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  // Ref for auto-dismiss timeout
   const successTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const fetcher = useFetcher<ActionData>();
-  const navigate = useNavigate();
   // const appBridge = useAppBridge(); // Removed again
 
   // Form State (Create/Edit Modal)
@@ -249,7 +231,7 @@ export default function WarrantyDefinitionsPage() {
   const [formState, setFormState] = useState({
     name: '',
     durationMonths: '',
-    priceType: PriceType.FIXED_AMOUNT, // Use local enum default
+    priceType: PriceType.FIXED_AMOUNT,
     priceValue: '',
     description: '',
     // associationType: WarrantyAssociationType.ALL_PRODUCTS, // Removed again
@@ -268,13 +250,7 @@ export default function WarrantyDefinitionsPage() {
 
   const handleOpenModalForCreate = useCallback(() => {
     setEditingId(null);
-    setFormState({ // Reset form
-      name: '',
-      durationMonths: '',
-      priceType: PriceType.FIXED_AMOUNT, // Use local enum
-      priceValue: '',
-      description: '',
-    });
+    setFormState({ name: '', durationMonths: '', priceType: PriceType.FIXED_AMOUNT, priceValue: '', description: '' });
     setModalOpen(true);
   }, []);
 
@@ -282,8 +258,8 @@ export default function WarrantyDefinitionsPage() {
     setEditingId(definition.id);
     setFormState({
         name: definition.name,
-        durationMonths: definition.durationMonths.toString(), // Convert number to string for input
-        priceType: definition.priceType, // Use local enum
+        durationMonths: definition.durationMonths.toString(),
+        priceType: definition.priceType,
         priceValue: definition.priceType === PriceType.FIXED_AMOUNT
                       ? (definition.priceValue / 100).toFixed(2)
                       : definition.priceValue.toString(),
@@ -295,10 +271,11 @@ export default function WarrantyDefinitionsPage() {
   const handleCloseModal = useCallback(() => {
     setModalOpen(false);
     setEditingId(null);
+    // Optionally clear form-related errors when closing the modal
     if (fetcher.data?.status === 'error' && fetcher.data.errors) {
-        // Maybe clear form state here too?
+       // Consider clearing fetcher.data if errors should not persist
     }
-  }, [fetcher.data]); // Added fetcher.data dependency
+  }, [fetcher.data]);
 
   // Handlers for Delete Confirmation Modal (Moved up)
   const handleOpenDeleteModal = useCallback((id: number) => {
@@ -310,7 +287,7 @@ export default function WarrantyDefinitionsPage() {
     setDefinitionIdToDelete(null);
     setDeleteModalOpen(false);
      if (fetcher.data?.status === 'error' && fetcher.formData?.get('actionType') === 'delete') {
-        // Maybe clear fetcher.data?
+       // Consider clearing fetcher.data if errors should not persist
      }
   }, [fetcher]); // Added fetcher dependency
 
@@ -335,26 +312,39 @@ export default function WarrantyDefinitionsPage() {
 
   // --- Effects --- (Grouped together)
 
-  // Effect to handle fetcher results (errors OR delete success)
+  // Effect to handle ALL fetcher results (CUD success and errors)
   useEffect(() => {
-    // Ensure fetcher is idle and has data
     if (fetcher.state === 'idle' && fetcher.data) {
       const data = fetcher.data;
 
       if (data.status === 'success') {
-        // Handle Delete success (receives JSON response)
-        if (data.deletedId) {
-             console.log("Delete successful (via fetcher):", data.message);
-             // Set message state first
-             setSuccessMessage(data.message!); // Show success message (Assert non-null)
-             // Update definitions state based on previous state
+        // Always set success message on success
+        setSuccessMessage(data.message!); // Assert non-null for success
+
+        // Handle Create/Update success
+        if (data.definition) {
+             console.log("Create/Update successful:", data.message);
+             const updatedDefinition = data.definition;
+             setWarrantyDefinitions(prev => {
+                 const index = prev.findIndex(def => def.id === updatedDefinition.id);
+                 if (index > -1) { // Update
+                     const newState = [...prev];
+                     newState[index] = updatedDefinition;
+                     return newState;
+                 } else { // Create
+                     return [updatedDefinition, ...prev];
+                 }
+             });
+             handleCloseModal(); // Close create/edit modal
+        }
+        // Handle Delete success
+        else if (data.deletedId) {
+             console.log("Delete successful:", data.message);
              setWarrantyDefinitions(prevDefs =>
                prevDefs.filter(def => def.id !== data.deletedId)
-             ); // Update state immediately
-             // Close modal after state updates are queued
-             handleCloseDeleteModal(); // Close delete confirmation modal
+             );
+             handleCloseDeleteModal(); // Close delete modal
         }
-        // Create/Update success is handled by page reload after redirect.
 
       } else if (data.status === 'error') {
         console.error("Action failed:", data.message);
@@ -369,35 +359,27 @@ export default function WarrantyDefinitionsPage() {
                  description: values.description || '',
              });
         }
-        // Note: Errors during delete are shown in the banner, modal might stay open or close depending on preference.
       }
     }
-    // Now includes handleCloseDeleteModal which is defined above
-  }, [fetcher.state, fetcher.data, modalOpen, handleCloseDeleteModal]);
+  }, [fetcher.state, fetcher.data, modalOpen, handleCloseModal, handleCloseDeleteModal]); // Consolidated dependencies
 
-  // Effect to auto-dismiss success message banner (from loader OR delete fetcher response)
+  // Effect to auto-dismiss success message banner
   useEffect(() => {
-    // Clear previous timeout if message changes or component re-renders
     if (successTimeoutRef.current) {
       clearTimeout(successTimeoutRef.current);
       successTimeoutRef.current = null;
     }
-
-    // If there's a success message (either from loader or fetcher response), set timeout
     if (successMessage) {
        successTimeoutRef.current = setTimeout(() => {
         setSuccessMessage(null);
         successTimeoutRef.current = null;
       }, 5000);
     }
-
-    // Cleanup function
     return () => {
       if (successTimeoutRef.current) {
         clearTimeout(successTimeoutRef.current);
       }
     };
-    // Now depends on the local successMessage state, not just initialSuccessMessage
   }, [successMessage]);
 
 
@@ -413,7 +395,7 @@ export default function WarrantyDefinitionsPage() {
     >
       <Frame> {/* Frame is needed for Toasts and potentially Modals */}
         <BlockStack gap="500">
-          {/* Display Success Banner (from flash message) */}
+          {/* Display Success Banner (controlled by local state) */}
           {successMessage && (
               <Banner title="Success" tone="success" onDismiss={() => setSuccessMessage(null)}>
                   <p>{successMessage}</p>
@@ -424,10 +406,9 @@ export default function WarrantyDefinitionsPage() {
               <Banner
                   title="Error"
                   tone='critical'
-                  // onDismiss={() => fetcher.data = undefined} // Avoid direct mutation
+                  // onDismiss={() => { /* Clear fetcher error? */ }}
               >
                   <p>{fetcher.data.message}</p>
-                  {/* Display field-specific errors if they exist (usually from create/edit) */}
                   {fetcher.data.errors && (
                     <BlockStack gap="100">
                         {Object.entries(fetcher.data.errors).map(([field, message]) => (
@@ -461,7 +442,6 @@ export default function WarrantyDefinitionsPage() {
                 formData.append('description', formState.description);
                 fetcher.submit(formData, { method: 'post' });
               },
-              // Loading state applies to create/update actions
               loading: fetcher.state !== 'idle' && (fetcher.formData?.get('actionType') === 'create' || fetcher.formData?.get('actionType') === 'update'),
               disabled: fetcher.state !== 'idle',
             }}
@@ -475,7 +455,6 @@ export default function WarrantyDefinitionsPage() {
                   onChange={(value) => handleInputChange(value, 'name')}
                   autoComplete="off"
                   requiredIndicator
-                  // Show error only if fetcher failed for create/update and modal is open
                   error={fetcher.data?.status === 'error' && modalOpen && (fetcher.formData?.get('actionType') === 'create' || fetcher.formData?.get('actionType') === 'update') ? fetcher.data.errors?.name : undefined}
                 />
                  <TextField
