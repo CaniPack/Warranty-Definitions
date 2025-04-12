@@ -32,6 +32,14 @@ model Session {
   emailVerified Boolean?  @default(false)
 }
 
+// Define Enum for association type
+enum WarrantyAssociationType {
+  ALL_PRODUCTS          // Applies to all products implicitly
+  UNASSIGNED_PRODUCTS   // Applies to products not covered by another SPECIFIC or COLLECTION warranty
+  SPECIFIC_PRODUCTS     // Applies only to products listed in associatedProductIds
+  SPECIFIC_COLLECTIONS  // Applies to all products within collections listed in associatedCollectionIds
+}
+
 // Defines the template or blueprint for a warranty
 model WarrantyDefinition {
   id             Int      @id @default(autoincrement())
@@ -42,6 +50,11 @@ model WarrantyDefinition {
   description    String?  // Optional description shown to admin/customer
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
+
+  // Association Fields
+  associationType    WarrantyAssociationType @default(ALL_PRODUCTS) // Default to all products
+  associatedProductIds String @default("[]") 
+  associatedCollectionIds String @default("[]") 
 
   // Relation to associations
   productAssociations ProductAssociation[]
