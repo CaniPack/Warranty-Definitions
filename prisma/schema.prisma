@@ -32,6 +32,12 @@ model Session {
   emailVerified Boolean?  @default(false)
 }
 
+// Define Enum for price type
+enum PriceType {
+  FIXED_AMOUNT
+  PERCENTAGE
+}
+
 // Define Enum for association type
 enum WarrantyAssociationType {
   ALL_PRODUCTS          // Applies to all products implicitly
@@ -45,7 +51,7 @@ model WarrantyDefinition {
   id             Int      @id @default(autoincrement())
   name           String   // e.g., "12-Month Electronics Warranty"
   durationMonths Int      // e.g., 12, 24, 36
-  priceType      String   // "PERCENTAGE" or "FIXED"
+  priceType      PriceType // Changed from String to Enum
   priceValue     Float    // The percentage (e.g., 10.0) or fixed amount (e.g., 29.99)
   description    String?  // Optional description shown to admin/customer
   createdAt      DateTime @default(now())
