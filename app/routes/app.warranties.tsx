@@ -4,19 +4,119 @@ import { json, LoaderFunctionArgs, ActionFunctionArgs, TypedResponse } from "@re
 import {
   useLoaderData,
   useFetcher,
+  useActionData,
+  useSubmit,
+  useNavigate,
 } from "@remix-run/react";
 import { useState, useCallback, useEffect, useRef } from "react";
 import {
   Page, Card, Layout, BlockStack, Text, IndexTable, Button,
-  Frame, Modal, FormLayout, TextField, Select, Banner,
-  InlineStack, ButtonGroup, EmptyState
+  Toast, Frame, Modal, FormLayout, TextField, Select, Banner,
+  InlineStack, ButtonGroup, EmptyState, List, Spinner, Icon, Box
 } from "@shopify/polaris";
+import { DeleteIcon } from "@shopify/polaris-icons";
+import { authenticate } from "~/shopify.server";
 import prisma from "~/db.server";
 // Import enums and types from Prisma
-import { WarrantyDefinition, WarrantyAssociationType, PriceType } from "@prisma/client";
-// Import useAppBridge and ResourcePicker actions
+import { WarrantyDefinition, WarrantyAssociationType } from "@prisma/client";
+// Correctly import useAppBridge from the react package
 import { useAppBridge } from '@shopify/app-bridge-react';
-import { ResourcePicker as ResourcePickerAction } from '@shopify/app-bridge/actions';
+// Import ResourcePicker directly from actions
+import { ResourcePicker } from '@shopify/app-bridge/actions';
+import { FormProvider } from "react-hook-form";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import React from "react";
+
+// --- Helper para obtener App Bridge de manera confiable ---
+function getAppBridge() {
+  // Estrategia 1: Usar el hook de App Bridge React
+  try {
+    // @ts-ignore - Ignoramos errores de tipo para diagnóstico
+    const appFromHook = useAppBridge();
+    
+    if (appFromHook && typeof (appFromHook as any).dispatch === 'function') {
+      console.log("✅ App Bridge obtenido correctamente usando useAppBridge()", appFromHook);
+      return appFromHook;
+    }
+    
+    console.log("⚠️ useAppBridge() devolvió un objeto inválido:", appFromHook);
+  } catch (error) {
+    console.error("❌ Error al usar useAppBridge():", error);
+  }
+  
+  // Estrategia 2: Intentar obtener desde el contexto global de Shopify
+  if (typeof window !== 'undefined' && window.shopify) {
+    try {
+      // @ts-ignore - window.shopify no tiene tipado definido para app
+      const shopifyGlobal = window.shopify;
+      
+      // Verificar si ya existe una instancia de app
+      // @ts-ignore - window.shopify.app no está definido en los tipos
+      if (shopifyGlobal.app && typeof shopifyGlobal.app.dispatch === 'function') {
+        console.log("✅ App Bridge obtenido del objeto global window.shopify.app");
+        // @ts-ignore - window.shopify.app no está definido en los tipos
+        return shopifyGlobal.app;
+      }
+      
+      console.log("⚠️ window.shopify existe pero no contiene una app válida");
+    } catch (error) {
+      console.error("❌ Error al acceder a window.shopify:", error);
+    }
+  }
+  
+  // Estrategia 3: Crear una nueva instancia si tenemos createApp disponible
+  if (typeof window !== 'undefined' && window.shopify) {
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      const shop = urlParams.get('shop');
+      const host = urlParams.get('host');
+      
+      if (!shop) {
+        console.log("⚠️ No se encontró parámetro 'shop' en la URL");
+        return null;
+      }
+      
+      // En lugar de usar process.env, obtener apiKey de manera segura
+      // 1. Intentar obtener de shopify.config si existe
+      // @ts-ignore
+      let apiKey: string | undefined = window.shopify.config?.apiKey;
+      
+      // 2. Si no existe, buscar en los datos cargados por Remix
+      if (!apiKey) {
+        // @ts-ignore
+        const remixData = window.__remixContext?.state?.loaderData?.["routes/app"];
+        apiKey = remixData?.apiKey;
+      }
+      
+      // 3. Si no existe, usar el API key hardcodeado (último recurso)
+      if (!apiKey) {
+        apiKey = "34217a05a589a81a31677dc5ebe26c0b";
+      }
+      
+      // @ts-ignore - window.shopify.createApp no está definido en los tipos
+      if (apiKey && window.shopify.createApp) {
+        const appConfig = {
+          apiKey: apiKey,
+          host: host || '',
+          shopOrigin: shop,
+          forceRedirect: true
+        };
+        
+        console.log("✅ Creando nueva instancia de App Bridge con:", appConfig);
+        // @ts-ignore - window.shopify.createApp no está definido en los tipos
+        const newApp = window.shopify.createApp(appConfig);
+        return newApp;
+      }
+    } catch (error) {
+      console.error("❌ Error al crear nueva instancia de App Bridge:", error);
+    }
+  }
+  
+  console.error("❌ No se pudo obtener ni crear una instancia de App Bridge");
+  return null;
+}
 
 // --- Local Type Definitions ---
 // No longer needed as PriceType is imported from Prisma
@@ -31,8 +131,7 @@ import { ResourcePicker as ResourcePickerAction } from '@shopify/app-bridge/acti
 interface WarrantyDefinitionFromLoader extends Omit<WarrantyDefinition, 'createdAt' | 'updatedAt' | 'associatedProductIds' | 'associatedCollectionIds'> {
   createdAt: string;
   updatedAt: string;
-  // priceType is already the correct enum from Prisma
-  // associationType is already the correct enum from Prisma
+  // Removed priceType and priceValue, using price instead
   associatedProductIds: string[]; // Parsed from JSON string
   associatedCollectionIds: string[]; // Parsed from JSON string
 }
@@ -62,12 +161,33 @@ type ActionData = ActionDataSuccess | ActionDataError;
 type WarrantyFormState = {
   name: string;
   durationMonths: string; // Keep as string for input
-  priceType: PriceType;
-  priceValue: string; // Keep as string for input
+  price: string; // Use a single price field
   description: string; // Use string, handle null on save
   associationType: WarrantyAssociationType;
 };
 
+interface DefinitionFromDb {
+  id: number;
+  name: string;
+  durationMonths: number;
+  price: number;
+  description: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  associationType: WarrantyAssociationType;
+  associatedProductIds: string;
+  associatedCollectionIds: string;
+};
+
+// Agregamos un schema de validación para el formulario
+const warrantySchema = z.object({
+  name: z.string().min(1, "El nombre es requerido"),
+  duration: z.number().min(1, "La duración debe ser mayor a 0").optional(),
+  duration_unit: z.string().optional(),
+  price: z.number().min(0, "El precio no puede ser negativo").optional(),
+  description: z.string().optional(),
+  associationType: z.string().optional(),
+});
 
 // Loader: Fetch warranty definitions including association fields
 export const loader = async ({ request }: LoaderFunctionArgs): Promise<TypedResponse<LoaderData>> => {
@@ -80,8 +200,7 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<TypedResp
         id: true,
         name: true,
         durationMonths: true,
-        priceType: true,
-        priceValue: true,
+        price: true,
         description: true,
         createdAt: true,
         updatedAt: true,
@@ -91,8 +210,8 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<TypedResp
       }
     });
 
-    // Map DB data to frontend type, parsing JSON ID strings
-    const definitionsFrontend: WarrantyDefinitionFromLoader[] = definitionsDb.map(def => {
+    // Map DB data to frontend type, using DefinitionFromDb for def
+    const definitionsFrontend: WarrantyDefinitionFromLoader[] = definitionsDb.map((def: DefinitionFromDb) => {
         let productIds: string[] = [];
         let collectionIds: string[] = [];
         try {
@@ -110,7 +229,7 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<TypedResp
             updatedAt: def.updatedAt.toISOString(),
             associatedProductIds: productIds,
             associatedCollectionIds: collectionIds,
-            // priceType and associationType enums are directly from Prisma select
+            // associationType enums are directly from Prisma select
         };
     });
 
@@ -124,230 +243,650 @@ export const loader = async ({ request }: LoaderFunctionArgs): Promise<TypedResp
 
 
 // Action: Handle Create, Update, Delete including association fields
-export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResponse<ActionData>> => {
-  console.log("🚨 SPARK ACTION START (with associations) 🚨");
+export const action = async ({ request }: ActionFunctionArgs): Promise<TypedResponse<ActionData | any>> => {
+  const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
-  const actionType = formData.get("actionType");
-  const id = formData.get("id");
-
+  
+  // Obtener el tipo de acción directamente de formData
+  const actionType = formData.get('_action') as string;
+  
+  console.log(`🚨 SPARK ACTION START (with associations) 🚨`);
+  
   try {
-    // --- Delete Action ---
-    if (actionType === "delete") {
-      if (!id) return json({ status: 'error', message: 'Missing ID for delete' }, { status: 400 });
-      try {
-        await prisma.warrantyDefinition.delete({ where: { id: Number(id) } });
-        return json({ status: 'success', message: 'Warranty definition deleted successfully.', deletedId: Number(id) });
-      } catch (error: any) {
-          if (error.code === 'P2025') return json({ status: 'error', message: 'Warranty definition not found for deletion.' }, { status: 404 });
-          console.error("🚨 SPARK ACTION (Delete) ERROR 🚨:", error);
-          return json({ status: 'error', message: `Failed to delete definition: ${error.message || 'Unknown error'}` }, { status: 500 });
+    // --- BÚSQUEDA DE PRODUCTOS O COLECCIONES ---
+    if (actionType === 'search_products') {
+      const query = formData.get('query') as string || '';
+      const result = await admin.graphql(
+        `query searchProducts($query: String!) {
+          products(first: 10, query: $query) {
+            edges {
+              node {
+                id
+                title
+                featuredImage {
+                  url
+                }
+              }
+            }
+          }
+        }`,
+        {
+          variables: {
+            query
+          }
+        }
+      );
+      
+      const responseJson = await result.json();
+      return json({ 
+        status: 'success',
+        searchType: 'products',
+        results: responseJson.data.products.edges.map((edge: any) => ({
+          id: edge.node.id,
+          title: edge.node.title,
+          imageUrl: edge.node.featuredImage?.url || null
+        }))
+      });
+    }
+    
+    if (actionType === 'search_collections') {
+      const query = formData.get('query') as string || '';
+      const result = await admin.graphql(
+        `query searchCollections($query: String!) {
+          collections(first: 10, query: $query) {
+            edges {
+              node {
+                id
+                title
+                image {
+                  url
+                }
+              }
+            }
+          }
+        }`,
+        {
+          variables: {
+            query
+          }
+        }
+      );
+      
+      const responseJson = await result.json();
+      return json({ 
+        status: 'success',
+        searchType: 'collections',
+        results: responseJson.data.collections.edges.map((edge: any) => ({
+          id: edge.node.id,
+          title: edge.node.title,
+          imageUrl: edge.node.image?.url || null
+        }))
+      });
+    }
+    
+    // --- ACCIONES CRUD ---
+    // Eliminar definición
+    if (actionType === 'delete') {
+      const id = formData.get('id') as string;
+      if (!id) {
+        return json({ status: 'error', message: 'ID is required for delete operation' }, { status: 400 });
       }
+      
+      await prisma.warrantyDefinition.delete({
+        where: { id: parseInt(id) }
+      });
+      
+      return json({ 
+        status: 'success', 
+        message: 'Warranty definition deleted successfully',
+        deletedId: parseInt(id)
+      });
     }
-
-    // --- Create / Update Action ---
-    const name = formData.get("name") as string;
-    const durationMonths = formData.get("durationMonths") as string;
-    const priceType = formData.get("priceType") as PriceType;
-    const priceValue = formData.get("priceValue") as string;
-    const description = formData.get("description") as string;
-    const associationType = formData.get("associationType") as WarrantyAssociationType;
-    // Get IDs as JSON strings from the form (submitted by frontend)
-    const associatedProductIdsStr = formData.get("associatedProductIds") as string || '[]';
-    const associatedCollectionIdsStr = formData.get("associatedCollectionIds") as string || '[]';
-
-    // Validation
-    const errors: Record<string, string> = {};
-    if (!name) errors.name = "Name is required";
-    // Stricter duration validation
-    if (!durationMonths || isNaN(parseInt(durationMonths, 10)) || parseInt(durationMonths, 10) <= 0) errors.durationMonths = "Duration must be a positive number";
-    if (!priceType || !Object.values(PriceType).includes(priceType)) errors.priceType = "Price type is required";
-    // Stricter price validation
-    if (!priceValue || isNaN(parseFloat(priceValue)) || parseFloat(priceValue) < 0) errors.priceValue = "Price value must be a non-negative number";
-    if (!associationType || !Object.values(WarrantyAssociationType).includes(associationType)) errors.associationType = "Association type is required";
-
-    // Validate JSON strings and ensure they are arrays only if a specific type is selected
-    let parsedProductIds: string[] = [];
-    let parsedCollectionIds: string[] = [];
-    if (associationType === WarrantyAssociationType.SPECIFIC_PRODUCTS) {
-        try {
-             parsedProductIds = JSON.parse(associatedProductIdsStr);
-             if (!Array.isArray(parsedProductIds)) throw new Error('Not an array');
-             // Optional: Validate GID format if needed
-        } catch (e) { errors.associatedProductIds = "Invalid product selection format."; }
+    
+    // Crear o actualizar definición
+    if (actionType === 'create' || actionType === 'update') {
+      // Extraer campos comunes
+      const name = formData.get('name') as string;
+      const durationMonthsStr = formData.get('durationMonths') as string;
+      const priceStr = formData.get('price') as string;
+      const description = formData.get('description') as string || null;
+      
+      // Validar campos requeridos
+      const errors: Record<string, string> = {};
+      
+      if (!name) errors.name = 'Name is required';
+      if (!durationMonthsStr) errors.durationMonths = 'Duration is required';
+      if (!priceStr) errors.price = 'Price is required';
+      
+      // Convertir y validar tipos numéricos
+      let durationMonths = 0;
+      let price = 0;
+      
+      if (durationMonthsStr) {
+        durationMonths = parseInt(durationMonthsStr, 10);
+        if (isNaN(durationMonths) || durationMonths <= 0) {
+          errors.durationMonths = 'Duration must be a positive number';
+        }
+      }
+      
+      if (priceStr) {
+        price = parseFloat(priceStr);
+        if (isNaN(price) || price < 0) {
+          errors.price = 'Price must be a non-negative number';
+        }
+      }
+      
+      // Si hay errores, devolverlos
+      if (Object.keys(errors).length > 0) {
+        return json({
+          status: 'error',
+          message: `Failed to ${actionType === 'create' ? 'create' : 'update'} warranty definition`,
+          errors,
+          fieldValues: Object.fromEntries(formData)
+        }, { status: 400 });
+      }
+      
+      // Preparar datos para guardar/actualizar
+      let dataToSave: any = {
+        name,
+        durationMonths,
+        price,
+        description,
+      };
+      
+      // Agregar asociaciones
+      const productId = formData.get('product_id') as string;
+      const productTitle = formData.get('product_title') as string;
+      const productImage = formData.get('product_image') as string;
+      const collectionId = formData.get('collection_id') as string;
+      const collectionTitle = formData.get('collection_title') as string;
+      const collectionImage = formData.get('collection_image') as string;
+      
+      if (productId && productTitle) {
+        dataToSave.products = {
+          create: [
+            {
+              productId,
+              title: productTitle,
+              imageUrl: productImage || null
+            }
+          ]
+        };
+      }
+      
+      if (collectionId && collectionTitle) {
+        dataToSave.collections = {
+          create: [
+            {
+              collectionId,
+              title: collectionTitle,
+              imageUrl: collectionImage || null
+            }
+          ]
+        };
+      }
+      
+      let savedDefinitionDb;
+      let successMessage: string;
+    
+      if (actionType === 'update') {
+        const id = formData.get('id') as string;
+        if (!id) {
+          return json({ status: 'error', message: 'ID is required for update operation' }, { status: 400 });
+        }
+        savedDefinitionDb = await prisma.warrantyDefinition.update({ where: { id: parseInt(id) }, data: dataToSave });
+        successMessage = "Warranty definition updated successfully";
+      } else {
+        savedDefinitionDb = await prisma.warrantyDefinition.create({ data: dataToSave });
+        successMessage = "Warranty definition created successfully";
+      }
+      
+      return json({
+        status: 'success',
+        message: successMessage,
+        definition: savedDefinitionDb
+      });
     }
-     if (associationType === WarrantyAssociationType.SPECIFIC_COLLECTIONS) {
-        try {
-            parsedCollectionIds = JSON.parse(associatedCollectionIdsStr);
-            if (!Array.isArray(parsedCollectionIds)) throw new Error('Not an array');
-            // Optional: Validate GID format if needed
-        } catch (e) { errors.associatedCollectionIds = "Invalid collection selection format."; }
-    }
-
-    if (Object.keys(errors).length > 0) {
-      const fieldValues = Object.fromEntries(formData);
-      return json({ status: 'error', message: 'Validation failed', errors, fieldValues }, { status: 400 });
-    }
-
-    // Prepare data for Prisma, ensuring IDs are saved as JSON strings
-    const dataToSave = {
-      name,
-      durationMonths: parseInt(durationMonths, 10),
-      priceType, // Already correct enum
-      priceValue: priceType === PriceType.FIXED_AMOUNT
-                    ? Math.round(parseFloat(priceValue) * 100) // Store cents
-                    : parseInt(priceValue, 10), // Store basis points or percentage value directly
-      description: description || null,
-      associationType,
-      // Save the validated (or default empty) JSON strings
-      associatedProductIds: associationType === WarrantyAssociationType.SPECIFIC_PRODUCTS ? associatedProductIdsStr : '[]',
-      associatedCollectionIds: associationType === WarrantyAssociationType.SPECIFIC_COLLECTIONS ? associatedCollectionIdsStr : '[]',
-    };
-
-    let savedDefinitionDb;
-    let successMessage: string;
-
-    if (actionType === "update" && id) {
-      savedDefinitionDb = await prisma.warrantyDefinition.update({ where: { id: Number(id) }, data: dataToSave });
-      successMessage = "Warranty definition updated successfully";
-    } else {
-      savedDefinitionDb = await prisma.warrantyDefinition.create({ data: dataToSave });
-      successMessage = "Warranty definition created successfully";
-    }
-
-    // Construct response, parsing IDs again for consistency in the return type
-    let responseProductIds: string[] = [];
-    let responseCollectionIds: string[] = [];
-    try { responseProductIds = JSON.parse(savedDefinitionDb.associatedProductIds || '[]'); if (!Array.isArray(responseProductIds)) responseProductIds = []; } catch {} ;
-    try { responseCollectionIds = JSON.parse(savedDefinitionDb.associatedCollectionIds || '[]'); if (!Array.isArray(responseCollectionIds)) responseCollectionIds = []; } catch {} ;
-
-    // Ensure the response matches WarrantyDefinitionFromLoader
-    const responseDefinition: WarrantyDefinitionFromLoader = {
-        id: savedDefinitionDb.id,
-        name: savedDefinitionDb.name,
-        durationMonths: savedDefinitionDb.durationMonths,
-        priceType: savedDefinitionDb.priceType,
-        priceValue: savedDefinitionDb.priceValue,
-        description: savedDefinitionDb.description,
-        createdAt: savedDefinitionDb.createdAt.toISOString(),
-        updatedAt: savedDefinitionDb.updatedAt.toISOString(),
-        associationType: savedDefinitionDb.associationType,
-        associatedProductIds: responseProductIds,
-        associatedCollectionIds: responseCollectionIds,
-    };
-
-    return json({ status: 'success', message: successMessage, definition: responseDefinition });
-
+    
+    // Si no coincide con ninguna acción conocida
+    return json({ 
+      status: 'error', 
+      message: `Unknown action type: ${actionType}` 
+    }, { status: 400 });
+    
   } catch (error: any) {
     console.error("🚨 SPARK ACTION ERROR 🚨:", error);
-    let errorMessage = `Failed to ${actionType || 'save'} definition: ${error.message || 'Unknown error'}`;
-    let status = 500;
-    if (error.code === 'P2002') {
-        errorMessage = 'A definition with similar key fields might already exist.';
-        status = 409;
-    }
-    return json({ status: 'error', message: errorMessage }, { status });
+    return json({ 
+      status: 'error', 
+      message: `Error processing action: ${error.message || 'Unknown error'}` 
+    }, { status: 500 });
   }
 };
 
 
 // --- Frontend Component ---
-export default function WarrantyDefinitionsPage() {
-  const { warrantyDefinitions: initialWarrantyDefinitions } = useLoaderData<LoaderData>();
-  const [warrantyDefinitions, setWarrantyDefinitions] = useState<WarrantyDefinitionFromLoader[]>(initialWarrantyDefinitions);
-  const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const successTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+export default function WarrantiesPage() {
+  const { warrantyDefinitions } = useLoaderData<LoaderData>();
+  const actionData = useActionData<typeof action>();
+  const submit = useSubmit();
+  const navigate = useNavigate();
   const fetcher = useFetcher<ActionData>();
-  const appBridge = useAppBridge(); // Needed for ResourcePicker
 
-  const [modalOpen, setModalOpen] = useState(false);
-  const [editingId, setEditingId] = useState<number | null>(null);
-  // Use the dedicated Form State type, including associationType
-  const [formState, setFormState] = useState<WarrantyFormState>({
-    name: '',
-    durationMonths: '',
-    priceType: PriceType.FIXED_AMOUNT,
-    priceValue: '',
-    description: '',
-    associationType: WarrantyAssociationType.ALL_PRODUCTS, // Default association
+  // Conditionally call useAppBridge only on the client
+  const isClient = typeof window !== 'undefined';
+  const app = useAppBridge();
+  
+  useEffect(() => {
+    // @ts-ignore - Ignoramos error de tipo, app.dispatch existe en runtime aunque TypeScript no lo reconozca
+    if (app && typeof app.dispatch === 'function') {
+      console.log("App Bridge disponible y funcional");
+    } else {
+      console.warn("App Bridge no está funcionando correctamente", app);
+    }
+  }, [app]);
+
+  // Estado para el formulario usando react-hook-form
+  const methods = useForm({
+    resolver: zodResolver(warrantySchema),
+    defaultValues: {
+      name: "",
+      duration: 0,
+      duration_unit: "days",
+      price: 0,
+      description: "",
+      associationType: WarrantyAssociationType.ALL_PRODUCTS,
+    }
   });
 
-  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
-  const [definitionIdToDelete, setDefinitionIdToDelete] = useState<number | null>(null);
-
-  // State for Resource Picker selections
+  // --- Estado para manejo de UI ---
+  const [isLoading, setIsLoading] = useState(false);
+  const [toast, setToast] = useState<{ message: string; error?: boolean } | null>(null);
+  
+  // --- Estado para selección de productos y colecciones ---
   const [selectedProductIds, setSelectedProductIds] = useState<string[]>([]);
   const [selectedCollectionIds, setSelectedCollectionIds] = useState<string[]>([]);
-
+  
   // --- Modal Handlers ---
-  const handleOpenModalForCreate = useCallback(() => {
-    setEditingId(null);
-    // Reset form state including association type and selections
-    setFormState({
-        name: '', durationMonths: '', priceType: PriceType.FIXED_AMOUNT, priceValue: '', description: '',
-        associationType: WarrantyAssociationType.ALL_PRODUCTS
+  const [isOpen, setIsOpen] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editingWarranty, setEditingWarranty] = useState<WarrantyDefinition | null>(null);
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [definitionIdToDelete, setDefinitionIdToDelete] = useState<string | null>(null);
+  
+  const formRef = React.useRef<HTMLFormElement>(null);
+  
+  const handleOpenModal = useCallback(() => {
+    setIsOpen(true);
+    setIsEditing(false);
+    setEditingWarranty(null);
+    methods.reset({
+      name: "",
+      duration: 0,
+      duration_unit: "days",
+      price: 0,
+      description: "",
+      associationType: WarrantyAssociationType.ALL_PRODUCTS,
     });
     setSelectedProductIds([]);
     setSelectedCollectionIds([]);
-    setModalOpen(true);
-  }, []);
-
-  const handleEdit = useCallback((definition: WarrantyDefinitionFromLoader) => {
-    setEditingId(definition.id);
-    // Populate form state including association type and selections
-    setFormState({
-        name: definition.name,
-        durationMonths: definition.durationMonths.toString(),
-        priceType: definition.priceType,
-        priceValue: definition.priceType === PriceType.FIXED_AMOUNT
-                      ? (definition.priceValue / 100).toFixed(2)
-                      : definition.priceValue.toString(),
-        description: definition.description ?? '',
-        associationType: definition.associationType,
-    });
-    setSelectedProductIds(definition.associatedProductIds || []);
-    setSelectedCollectionIds(definition.associatedCollectionIds || []);
-    setModalOpen(true);
-  }, []);
-
+  }, [methods]);
+  
   const handleCloseModal = useCallback(() => {
-    setModalOpen(false);
-    setEditingId(null);
-    // Clear fetcher data on close to prevent stale errors showing on reopen
-    if (fetcher.data) {
-       fetcher.data = undefined;
+    setIsOpen(false);
+  }, []);
+  
+  const handleOpenEditModal = useCallback((warranty: WarrantyDefinition) => {
+    setIsEditing(true);
+    setEditingWarranty(warranty);
+    methods.reset({
+      name: warranty.name,
+      duration: warranty.duration || 0,
+      duration_unit: warranty.duration_unit || "days",
+      price: warranty.price || 0,
+      description: warranty.description || "",
+      associationType: warranty.associationType || WarrantyAssociationType.ALL_PRODUCTS,
+    });
+    
+    // Cargar los IDs de productos/colecciones asociados
+    try {
+      const productIds = JSON.parse(warranty.associatedProductIds || "[]");
+      const collectionIds = JSON.parse(warranty.associatedCollectionIds || "[]");
+      setSelectedProductIds(productIds);
+      setSelectedCollectionIds(collectionIds);
+    } catch (e) {
+      console.error("Error al cargar productos/colecciones asociados", e);
     }
-  }, [fetcher]);
-
-  const handleOpenDeleteModal = useCallback((id: number) => {
+    
+    setIsOpen(true);
+  }, [methods]);
+  
+  const handleOpenDeleteModal = useCallback((id: string) => {
     setDefinitionIdToDelete(id);
     setDeleteModalOpen(true);
   }, []);
-
+  
   const handleCloseDeleteModal = useCallback(() => {
-    setDefinitionIdToDelete(null);
     setDeleteModalOpen(false);
-     if (fetcher.data?.status === 'error' && fetcher.formData?.get('actionType') === 'delete') {
-       fetcher.data = undefined;
-     }
-  }, [fetcher]);
+    setDefinitionIdToDelete(null);
+  }, []);
 
-  const handleDeleteDefinition = useCallback(() => {
-    if (definitionIdToDelete !== null) {
-        const formData = new FormData();
-        formData.append('actionType', 'delete');
-        formData.append('id', String(definitionIdToDelete));
-        fetcher.submit(formData, { method: 'post' });
+  // Función para manejar el cambio de tipo de asociación
+  const handleAssociationTypeChange = useCallback((value: string) => {
+    methods.setValue("associationType", value);
+    
+    // Limpiar selecciones si cambiamos a un tipo que no las usa
+    if (value !== WarrantyAssociationType.SPECIFIC_PRODUCTS) {
+      setSelectedProductIds([]);
     }
-  }, [definitionIdToDelete, fetcher]);
+    
+    if (value !== WarrantyAssociationType.SPECIFIC_COLLECTIONS) {
+      setSelectedCollectionIds([]);
+    }
+  }, [methods]);
+
+  // Función para manejar la selección de productos
+  const handleProductSelection = useCallback(() => {
+    if (!app) {
+      console.error("App Bridge no está disponible");
+      return;
+    }
+    
+    // @ts-ignore - Ignoramos error de tipo, app.dispatch existe en runtime aunque TypeScript no lo reconozca
+    if (typeof app.dispatch !== 'function') {
+      console.error("app.dispatch no es una función", typeof app.dispatch);
+      return;
+    }
+    
+    try {
+      // Primero, asegurarnos de que estamos en el tipo correcto de asociación
+      methods.setValue("associationType", WarrantyAssociationType.SPECIFIC_PRODUCTS);
+      
+      // @ts-ignore - Ignoramos el error de tipo ya que sabemos que app es una instancia válida en este punto
+      const productPicker = ResourcePicker.create(app, {
+        resourceType: ResourcePicker.ResourceType.Product,
+        options: {
+          selectMultiple: true,
+          showVariants: false,
+        },
+      });
+      
+      productPicker.subscribe(ResourcePicker.Action.SELECT, ({ selection }) => {
+        console.log("Productos seleccionados:", selection);
+        // @ts-ignore - Ignoramos el error de tipo para los items
+        setSelectedProductIds(selection.map(item => item.id));
+        productPicker.unsubscribe();
+      });
+      
+      productPicker.subscribe(ResourcePicker.Action.CANCEL, () => {
+        console.log("Selección de productos cancelada");
+        productPicker.unsubscribe();
+      });
+      
+      productPicker.dispatch(ResourcePicker.Action.OPEN);
+    } catch (error) {
+      console.error("Error al crear el ResourcePicker:", error);
+    }
+  }, [app, methods]);
+  
+  // Función para manejar la selección de colecciones
+  const handleCollectionSelection = useCallback(() => {
+    if (!app) {
+      console.error("App Bridge no está disponible");
+      return;
+    }
+    
+    // @ts-ignore - Ignoramos error de tipo, app.dispatch existe en runtime aunque TypeScript no lo reconozca
+    if (typeof app.dispatch !== 'function') {
+      console.error("app.dispatch no es una función", typeof app.dispatch);
+      return;
+    }
+    
+    try {
+      // @ts-ignore - Ignoramos el error de tipo ya que sabemos que app es una instancia válida en este punto
+      const collectionPicker = ResourcePicker.create(app, {
+        resourceType: ResourcePicker.ResourceType.Collection,
+        options: {
+          selectMultiple: true,
+        },
+      });
+      
+      collectionPicker.subscribe(ResourcePicker.Action.SELECT, ({ selection }) => {
+        console.log("Colecciones seleccionadas:", selection);
+        // @ts-ignore - Ignoramos el error de tipo para los items
+        setSelectedCollectionIds(selection.map(item => item.id));
+        collectionPicker.unsubscribe();
+      });
+      
+      collectionPicker.subscribe(ResourcePicker.Action.CANCEL, () => {
+        console.log("Selección de colecciones cancelada");
+        collectionPicker.unsubscribe();
+      });
+      
+      collectionPicker.dispatch(ResourcePicker.Action.OPEN);
+    } catch (error) {
+      console.error("Error al crear el ResourcePicker:", error);
+    }
+  }, [app]);
+  
+  const modalMarkup = (
+    <Modal
+      open={isOpen}
+      onClose={handleCloseModal}
+      title={isEditing ? "Editar garantía" : "Crear nueva garantía"}
+      primaryAction={{
+        content: isEditing ? "Guardar cambios" : "Crear garantía",
+        onAction: methods.handleSubmit(() => {
+          formRef.current?.submit();
+        }),
+      }}
+      secondaryActions={[
+        {
+          content: "Cancelar",
+          onAction: handleCloseModal,
+        },
+      ]}
+    >
+      <Modal.Section>
+        <FormProvider {...methods}>
+          <form ref={formRef} method="post" encType="multipart/form-data">
+            <input type="hidden" name="actionType" value={isEditing ? "update" : "create"} />
+            {isEditing && <input type="hidden" name="id" value={editingWarranty?.id} />}
+            
+            {/* @ts-ignore - Ignoramos error de tipo para fetcher.data.errors */}
+            {fetcher.data?.errors && (
+              <Banner tone="critical">
+                <List>
+                  {/* @ts-ignore - Ignoramos error de tipo para fetcher.data.errors */}
+                  {Object.entries(fetcher.data.errors).map(([field, message]) => (
+                    <List.Item key={field}>{String(message)}</List.Item>
+                  ))}
+                </List>
+              </Banner>
+            )}
+
+            <BlockStack gap="400">
+              <FormLayout>
+                <TextField
+                  label="Nombre de la garantía"
+                  type="text"
+                  name="name"
+                  autoComplete="off"
+                  value={methods.watch("name")}
+                  onChange={(value) => methods.setValue("name", value)}
+                  error={methods.formState.errors.name?.message}
+                />
+
+                <FormLayout.Group>
+                  <TextField
+                    label="Duración"
+                    type="number"
+                    name="duration"
+                    autoComplete="off"
+                    value={String(methods.watch("duration") || "")}
+                    onChange={(value) => methods.setValue("duration", value ? Number(value) : undefined)}
+                    error={methods.formState.errors.duration?.message}
+                  />
+                  
+                  <Select
+                    label="Unidad"
+                    name="duration_unit"
+                    options={[
+                      {label: "Días", value: "days"},
+                      {label: "Semanas", value: "weeks"},
+                      {label: "Meses", value: "months"},
+                      {label: "Años", value: "years"}
+                    ]}
+                    value={methods.watch("duration_unit")}
+                    onChange={(value) => methods.setValue("duration_unit", value)}
+                  />
+                </FormLayout.Group>
+
+                <TextField
+                  label="Precio"
+                  type="number"
+                  name="price"
+                  autoComplete="off"
+                  value={String(methods.watch("price") || "")}
+                  onChange={(value) => methods.setValue("price", value ? Number(value) : undefined)}
+                  error={methods.formState.errors.price?.message}
+                />
+
+                <TextField
+                  label="Descripción"
+                  type="text"
+                  name="description"
+                  autoComplete="off"
+                  multiline={4}
+                  value={methods.watch("description")}
+                  onChange={(value) => methods.setValue("description", value)}
+                  error={methods.formState.errors.description?.message}
+                />
+
+                {/* Selector de tipo de asociación */}
+                <Select
+                  label="Aplicar garantía a"
+                  name="associationType"
+                  options={[
+                    {label: "Todos los productos", value: WarrantyAssociationType.ALL_PRODUCTS},
+                    {label: "Productos no asignados", value: WarrantyAssociationType.UNASSIGNED_PRODUCTS},
+                    {label: "Productos específicos", value: WarrantyAssociationType.SPECIFIC_PRODUCTS},
+                    {label: "Colecciones específicas", value: WarrantyAssociationType.SPECIFIC_COLLECTIONS},
+                  ]}
+                  value={methods.watch("associationType")}
+                  onChange={handleAssociationTypeChange}
+                />
+              </FormLayout>
+
+              {/* Sección de productos seleccionados - solo visible si es SPECIFIC_PRODUCTS */}
+              {methods.watch("associationType") === WarrantyAssociationType.SPECIFIC_PRODUCTS && (
+                <Card>
+                  <BlockStack gap="400">
+                    <InlineStack align="space-between">
+                      <Text variant="headingMd" as="h2">Productos seleccionados</Text>
+                      <SimplePicker 
+                        resourceType="Product" 
+                        onSelect={(selection) => {
+                          // @ts-ignore - No nos preocupamos por el tipo exacto
+                          setSelectedProductIds(selection.map(item => item.id));
+                        }}
+                        onCancel={() => console.log("Selección cancelada")}
+                      />
+                    </InlineStack>
+
+                    {selectedProductIds.length > 0 ? (
+                      <div>
+                        <List type="bullet">
+                          {selectedProductIds.map((id) => (
+                            <List.Item key={id}>
+                              {id}
+                              <Button 
+                                variant="plain" 
+                                onClick={() => {
+                                  setSelectedProductIds(prev => 
+                                    prev.filter(p => p !== id)
+                                  );
+                                }}
+                                accessibilityLabel={`Eliminar producto ${id}`}
+                              />
+                              <input
+                                type="hidden"
+                                name="products[]"
+                                value={id}
+                              />
+                            </List.Item>
+                          ))}
+                        </List>
+                      </div>
+                    ) : (
+                      <Text as="p" tone="subdued">No hay productos seleccionados</Text>
+                    )}
+                  </BlockStack>
+                </Card>
+              )}
+
+              {/* Sección de colecciones seleccionadas - solo visible si es SPECIFIC_COLLECTIONS */}
+              {methods.watch("associationType") === WarrantyAssociationType.SPECIFIC_COLLECTIONS && (
+                <Card>
+                  <BlockStack gap="400">
+                    <InlineStack align="space-between">
+                      <Text variant="headingMd" as="h2">Colecciones seleccionadas</Text>
+                      <SimplePicker 
+                        resourceType="Collection" 
+                        onSelect={(selection) => {
+                          // @ts-ignore - No nos preocupamos por el tipo exacto
+                          setSelectedCollectionIds(selection.map(item => item.id));
+                        }}
+                        onCancel={() => console.log("Selección cancelada")}
+                      />
+                    </InlineStack>
+
+                    {selectedCollectionIds.length > 0 ? (
+                      <div>
+                        <List type="bullet">
+                          {selectedCollectionIds.map((id) => (
+                            <List.Item key={id}>
+                              {id}
+                              <Button 
+                                variant="plain" 
+                                onClick={() => {
+                                  setSelectedCollectionIds(prev => 
+                                    prev.filter(c => c !== id)
+                                  );
+                                }}
+                                accessibilityLabel={`Eliminar colección ${id}`}
+                              />
+                              <input
+                                type="hidden"
+                                name="collections[]"
+                                value={id}
+                              />
+                            </List.Item>
+                          ))}
+                        </List>
+                      </div>
+                    ) : (
+                      <Text as="p" tone="subdued">No hay colecciones seleccionadas</Text>
+                    )}
+                  </BlockStack>
+                </Card>
+              )}
+            </BlockStack>
+          </form>
+        </FormProvider>
+      </Modal.Section>
+    </Modal>
+  );
 
   // --- Input Handlers ---
   const handleFormValueChange = useCallback(<T extends keyof WarrantyFormState>(field: T, value: WarrantyFormState[T]) => {
+     // Usar methods de React Hook Form en lugar de setFormState
      if (field === 'durationMonths') {
         const numericValue = String(value).replace(/\D/g, '');
-        setFormState(prev => ({ ...prev, [field]: numericValue }));
+        methods.setValue(field as any, numericValue);
      } else {
-         setFormState(prev => ({ ...prev, [field]: value }));
+        methods.setValue(field as any, value);
      }
+     
      // Reset picker selections if association type changes away from specific
      if (field === 'associationType') {
         if (value !== WarrantyAssociationType.SPECIFIC_PRODUCTS) {
@@ -357,278 +896,125 @@ export default function WarrantyDefinitionsPage() {
             setSelectedCollectionIds([]);
         }
      }
-  }, []);
+  }, [methods]);
 
-  // --- Resource Picker Logic ---
-  const handleOpenPicker = useCallback(async () => {
-    const resourceType = formState.associationType === WarrantyAssociationType.SPECIFIC_PRODUCTS ? 'Product' : 'Collection';
-    const initialSelectionIds = formState.associationType === WarrantyAssociationType.SPECIFIC_PRODUCTS
-      ? selectedProductIds.map(id => ({ id }))
-      : selectedCollectionIds.map(id => ({ id }));
+  // --- Resource Picker Logic (Updated based on new pattern) ---
+  const handleOpenPicker = useCallback(() => {
+    // Solo ejecutar en el cliente
+    if (!isClient) return;
 
     try {
-      // Use appBridge.dispatch with ResourcePicker actions
-      appBridge.dispatch(ResourcePickerAction.select({
-        type: resourceType,
-        multiple: true,
-        selectionIds: initialSelectionIds,
-      }));
-      // Note: Selection handling is now done via event listener (added below)
-      console.log(`Dispatched ${resourceType} picker action.`);
+      // Usar nuestra función helper en lugar de useAppBridge directamente
+      const app = getAppBridge();
+      
+      // Diagnóstico para la consola
+      console.log('🚨 AppBridge instance in handleOpenPicker:', app);
+      if (app) {
+        console.log('🚨 typeof app.dispatch:', typeof app.dispatch);
+        console.log('🚨 app.constructor.name:', app.constructor?.name);
+      }
+      
+      if (!app || typeof app.dispatch !== 'function') {
+        console.error("❌ Error: AppBridge instance is not valid or dispatch is not a function");
+        // Mostrar alerta amigable para el usuario
+        alert("No se pudo inicializar el selector de productos oficial de Shopify. Por favor, usa el botón 'Seleccionar (Simple)' como alternativa.");
+        return;
+      }
+
+      // Usar valores predeterminados en lugar de intentar obtener el associationType
+      const resourceType = ResourcePicker.ResourceType.Product;
+      const initialSelection = selectedProductIds.map(id => ({ id }));
+      const pickerTypeText = 'Product';
+      
+      console.log(`🚨 Opening ${pickerTypeText} Picker with initial selection:`, initialSelection);
+      
+      try {
+        // Crear el picker sin necesidad de usar @ts-ignore
+        const picker = ResourcePicker.create(app, {
+          resourceType,
+          options: {
+            selectMultiple: true,
+            initialSelectionIds: initialSelection,
+          },
+        });
+
+        // Suscribirse a eventos
+        picker.subscribe(ResourcePicker.Action.SELECT, ({ selection }) => {
+          console.log(`🚨 ${pickerTypeText} Picker SELECT payload:`, selection);
+          const selectedIds = selection.map((item: any) => item.id);
+          setSelectedProductIds(selectedIds);
+        });
+
+        picker.subscribe(ResourcePicker.Action.CANCEL, () => {
+          console.log(`🚨 ${pickerTypeText} Picker CANCELLED`);
+        });
+
+        // Abrir el picker usando dispatch directamente
+        picker.dispatch(ResourcePicker.Action.OPEN);
+      } catch (error: any) {
+        console.error('❌ Error creating or dispatching ResourcePicker:', error);
+        alert(`Error al abrir el selector: ${error?.message || 'Desconocido'}\nPor favor, usa el botón 'Seleccionar (Simple)' como alternativa.`);
+      }
     } catch (error: any) {
-      console.error('An error occurred dispatching the resource picker action:', error);
-      // Optionally show error to user
+      console.error('❌ Error in handleOpenPicker:', error);
+      alert(`Error general: ${error?.message || 'Desconocido'}\nPor favor, usa el botón 'Seleccionar (Simple)' como alternativa.`);
     }
-  }, [appBridge, formState.associationType, selectedProductIds, selectedCollectionIds]);
+  }, [isClient, selectedProductIds]);
 
   // --- Effects ---
-
-  // Effect to handle Resource Picker selection events
-  useEffect(() => {
-    // Don't run effect if appBridge isn't available (e.g., during SSR)
-    if (typeof window === 'undefined' || !appBridge) return;
-
-    console.log("Setting up App Bridge subscriptions...");
-
-    // Restore appBridge.subscribe usage, add null check just in case
-    // Add explicit 'any' to payload to silence linter while environment is broken
-    const unsubscribe = appBridge.subscribe?.(ResourcePickerAction.Action.SELECT, (payload: any) => {
-      console.log('Resource Picker SELECT event received:', payload);
-      if (payload?.selection) {
-          const ids = payload.selection.map((resource: { id: string }) => resource.id);
-          if (formState.associationType === WarrantyAssociationType.SPECIFIC_PRODUCTS) {
-              setSelectedProductIds(ids);
-          } else if (formState.associationType === WarrantyAssociationType.SPECIFIC_COLLECTIONS) {
-              setSelectedCollectionIds(ids);
-          }
-      }
-    });
-
-    // Restore appBridge.subscribe usage for cancel event too
-    const unsubscribeCancel = appBridge.subscribe?.(ResourcePickerAction.Action.CANCEL, () => {
-       console.log('Resource Picker CANCEL event received');
-    });
-
-    // Cleanup subscription on component unmount
-    return () => {
-        // Check if unsubscribe functions exist before calling
-        unsubscribe?.();
-        unsubscribeCancel?.();
-    };
-    // Re-run if appBridge or associationType changes (to ensure correct type handling)
-  }, [appBridge, formState.associationType]);
-
   // Effect to handle ALL fetcher results
   useEffect(() => {
     if (fetcher.state === 'idle' && fetcher.data) {
       const data = fetcher.data;
       if (data.status === 'success') {
-        setSuccessMessage(data.message!);
+        setToast({ message: data.message, error: false });
         if (data.definition) { // Create/Update success
-             const updatedDefinition = data.definition;
-             setWarrantyDefinitions(prev => {
-                 const index = prev.findIndex(def => def.id === updatedDefinition.id);
-                 if (index > -1) { // Update
-                     const newState = [...prev];
-                     newState[index] = updatedDefinition;
-                     return newState;
-                 } else { // Create
-                     return [updatedDefinition, ...prev];
-                 }
-             });
              handleCloseModal();
         } else if (data.deletedId) { // Delete success
-             setWarrantyDefinitions(prevDefs =>
-               prevDefs.filter(def => def.id !== data.deletedId)
-             );
              handleCloseDeleteModal();
         }
       } else if (data.status === 'error') {
         console.error("Action failed:", data.message);
+        setToast({ message: data.message, error: true });
         // Repopulate form state on validation error ONLY if modal is open
-        if (modalOpen && data.errors && data.fieldValues) {
+        if (isOpen && data.errors && data.fieldValues) {
             // Safely access potentially missing fields
             const values = data.fieldValues;
-             setFormState({
-                 name: values.name || '',
-                 durationMonths: values.durationMonths || '',
-                 priceType: (Object.values(PriceType).includes(values.priceType) ? values.priceType : PriceType.FIXED_AMOUNT) as PriceType,
-                 priceValue: values.priceValue || '',
-                 description: values.description || '',
-                 associationType: (Object.values(WarrantyAssociationType).includes(values.associationType) ? values.associationType : WarrantyAssociationType.ALL_PRODUCTS) as WarrantyAssociationType,
-             });
-             // Repopulate picker state from the stringified JSON sent back
-             try { setSelectedProductIds(JSON.parse(values.associatedProductIds || '[]')); } catch { setSelectedProductIds([])} ;
-             try { setSelectedCollectionIds(JSON.parse(values.associatedCollectionIds || '[]')); } catch { setSelectedCollectionIds([])} ;
+            // Actualizar el formulario con React Hook Form usando los nombres correctos
+            methods.reset({
+                name: values.name || '',
+                duration: values.duration ? Number(values.duration) : 0,
+                duration_unit: values.duration_unit || 'days',
+                price: values.price ? Number(values.price) : 0,
+                description: values.description || '',
+            });
+            // Repopulate picker state from the stringified JSON sent back
+            try { setSelectedProductIds(JSON.parse(values.associatedProductIds || '[]')); } catch { setSelectedProductIds([])} ;
+            try { setSelectedCollectionIds(JSON.parse(values.associatedCollectionIds || '[]')); } catch { setSelectedCollectionIds([])} ;
         }
       }
-      // Clear fetcher data after processing to prevent re-triggering
-      // Be careful if other effects depend on fetcher.data persisting
-      // fetcher.data = undefined; // Consider if needed
     }
-  }, [fetcher.state, fetcher.data, modalOpen, handleCloseModal, handleCloseDeleteModal]); // Added modalOpen dependency
-
-  // Effect to auto-dismiss success message banner
-  useEffect(() => {
-    if (successTimeoutRef.current) {
-      clearTimeout(successTimeoutRef.current);
-      successTimeoutRef.current = null;
-    }
-    if (successMessage) {
-       successTimeoutRef.current = setTimeout(() => {
-        setSuccessMessage(null);
-        successTimeoutRef.current = null;
-      }, 5000);
-    }
-    return () => {
-      if (successTimeoutRef.current) {
-        clearTimeout(successTimeoutRef.current);
-      }
-    };
-  }, [successMessage]);
+  }, [fetcher.state, fetcher.data, isOpen, handleCloseModal, handleCloseDeleteModal, methods]);
 
   // --- JSX Render ---
   return (
     <Page
         title="Warranty Definitions"
-        primaryAction={{ content: 'Create Definition', onAction: handleOpenModalForCreate }}
+        primaryAction={{ content: 'Create Definition', onAction: handleOpenModal }}
     >
       <Frame>
         <BlockStack gap="500">
-          {/* Banners */}
-          {successMessage && (
-              <Banner title="Success" tone="success" onDismiss={() => setSuccessMessage(null)}>
-                  <p>{successMessage}</p>
-              </Banner>
+          {/* Toasts para notificaciones */}
+          {toast && (
+            <Toast
+              content={toast.message}
+              error={toast.error}
+              onDismiss={() => setToast(null)}
+            />
           )}
-          {fetcher.data?.status === 'error' && fetcher.state === 'idle' && (
-              <Banner title="Error" tone='critical' onDismiss={() => { fetcher.data = undefined; }}>
-                  <p>{fetcher.data.message}</p>
-                  {fetcher.data.errors && (
-                    <BlockStack gap="100">
-                        {Object.entries(fetcher.data.errors).map(([field, message]) => (
-                            <Text key={field} as="p" tone="critical">&#8226; {message}</Text>
-                        ))}
-                    </BlockStack>
-                  )}
-              </Banner>
-          )}
-
-          {/* No Resource Picker Component Rendered Here */}
 
           {/* Create/Edit Modal */}
-          <Modal
-            open={modalOpen}
-            onClose={handleCloseModal}
-            title={editingId ? "Edit Warranty Definition" : "Create Warranty Definition"}
-            primaryAction={{
-              content: editingId ? 'Save Changes' : 'Create Definition',
-              onAction: () => {
-                const formData = new FormData();
-                formData.append('actionType', editingId ? 'update' : 'create');
-                if (editingId) {
-                  formData.append('id', String(editingId));
-                }
-                // Append all formState fields
-                Object.entries(formState).forEach(([key, value]) => {
-                    const valueToSend = (key === 'description' && value === null) ? '' : value;
-                    formData.append(key, valueToSend as string);
-                });
-                // Send IDs as JSON strings (using current state)
-                formData.append('associatedProductIds', JSON.stringify(selectedProductIds));
-                formData.append('associatedCollectionIds', JSON.stringify(selectedCollectionIds));
-                fetcher.submit(formData, { method: 'post' });
-              },
-              loading: fetcher.state !== 'idle' && (fetcher.formData?.get('actionType') === 'create' || fetcher.formData?.get('actionType') === 'update'),
-              disabled: fetcher.state !== 'idle',
-            }}
-            secondaryActions={[{ content: 'Cancel', onAction: handleCloseModal, disabled: fetcher.state !== 'idle' }]}
-          >
-            <Modal.Section>
-              <FormLayout>
-                <TextField
-                  label="Warranty Name"
-                  value={formState.name}
-                  onChange={(value) => handleFormValueChange('name', value)}
-                  autoComplete="off"
-                  requiredIndicator
-                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.name : undefined}
-                />
-                 <TextField
-                  label="Duration (Months)"
-                  type="text" inputMode="numeric"
-                  value={formState.durationMonths}
-                  onChange={(value) => handleFormValueChange('durationMonths', value)}
-                  autoComplete="off"
-                  requiredIndicator
-                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.durationMonths : undefined}
-                />
-                 <Select
-                  label="Price Type"
-                  options={Object.values(PriceType).map(pt => ({ label: formatPriceType(pt), value: pt }))}
-                  value={formState.priceType}
-                  onChange={(value) => handleFormValueChange('priceType', value as PriceType)}
-                  requiredIndicator
-                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.priceType : undefined}
-                />
-                 <TextField
-                  label={formState.priceType === PriceType.FIXED_AMOUNT ? "Price ($)" : "Price (%)"}
-                  type="number"
-                  prefix={formState.priceType === PriceType.FIXED_AMOUNT ? '$' : undefined}
-                  suffix={formState.priceType === PriceType.PERCENTAGE ? '%' : undefined}
-                  value={formState.priceValue}
-                  onChange={(value) => handleFormValueChange('priceValue', value)}
-                  autoComplete="off"
-                  requiredIndicator
-                  step={formState.priceType === PriceType.FIXED_AMOUNT ? 0.01 : 1}
-                  min="0"
-                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.priceValue : undefined}
-                />
-                <TextField
-                  label="Description (Optional)"
-                  value={formState.description}
-                  onChange={(value) => handleFormValueChange('description', value)}
-                  autoComplete="off"
-                  multiline={3}
-                />
-
-                {/* Association Type Selector */}
-                <Select
-                  label="Applies To"
-                  options={Object.values(WarrantyAssociationType).map(at => ({ label: formatAssociationType(at), value: at }))}
-                  value={formState.associationType}
-                  onChange={(value) => handleFormValueChange('associationType', value as WarrantyAssociationType)}
-                  requiredIndicator
-                  error={fetcher.data?.status === 'error' && modalOpen ? fetcher.data.errors?.associationType : undefined}
-                />
-
-                {/* Conditional UI for Specific Products/Collections */}
-                 {formState.associationType === WarrantyAssociationType.SPECIFIC_PRODUCTS && (
-                  <BlockStack gap="200">
-                    <InlineStack align="space-between">
-                        <Text variant="bodyMd" as="p">Selected Products: {selectedProductIds.length}</Text>
-                        <Button onClick={handleOpenPicker} size="slim" disabled={fetcher.state !== 'idle'}>Select Products</Button>
-                    </InlineStack>
-                    {fetcher.data?.status === 'error' && modalOpen && fetcher.data.errors?.associatedProductIds && (
-                         <Banner tone="critical" title="Selection Error"><p>{fetcher.data.errors.associatedProductIds}</p></Banner>
-                    )}
-                  </BlockStack>
-                )}
-                {formState.associationType === WarrantyAssociationType.SPECIFIC_COLLECTIONS && (
-                   <BlockStack gap="200">
-                     <InlineStack align="space-between">
-                        <Text variant="bodyMd" as="p">Selected Collections: {selectedCollectionIds.length}</Text>
-                        <Button onClick={handleOpenPicker} size="slim" disabled={fetcher.state !== 'idle'}>Select Collections</Button>
-                    </InlineStack>
-                     {fetcher.data?.status === 'error' && modalOpen && fetcher.data.errors?.associatedCollectionIds && (
-                         <Banner tone="critical" title="Selection Error"><p>{fetcher.data.errors.associatedCollectionIds}</p></Banner>
-                    )}
-                   </BlockStack>
-                )}
-
-              </FormLayout>
-            </Modal.Section>
-          </Modal>
+          {modalMarkup}
 
           {/* Delete Confirmation Modal */}
            <Modal
@@ -636,8 +1022,18 @@ export default function WarrantyDefinitionsPage() {
               onClose={handleCloseDeleteModal}
               title="Delete Warranty Definition?"
               primaryAction={{
-                  content: 'Delete', destructive: true, onAction: handleDeleteDefinition,
-                  loading: fetcher.state !== 'idle' && fetcher.formData?.get('actionType') === 'delete',
+                  content: 'Delete', 
+                  destructive: true, 
+                  onAction: () => {
+                    if (definitionIdToDelete) {
+                      const formData = new FormData();
+                      formData.append('actionType', 'delete');
+                      formData.append('id', definitionIdToDelete);
+                      submit(formData, { method: 'post' });
+                      handleCloseDeleteModal();
+                    }
+                  },
+                  loading: fetcher.state !== 'idle' && fetcher.formData?.get('_action') === 'delete',
                   disabled: fetcher.state !== 'idle',
               }}
               secondaryActions={[{ content: 'Cancel', onAction: handleCloseDeleteModal, disabled: fetcher.state !== 'idle' }]}
@@ -662,18 +1058,16 @@ export default function WarrantyDefinitionsPage() {
                         <IndexTable.Row id={String(definition.id)} key={definition.id} position={index}>
                             <IndexTable.Cell>{definition.name}</IndexTable.Cell>
                             <IndexTable.Cell>{definition.durationMonths} months</IndexTable.Cell>
-                            <IndexTable.Cell>
-                                {formatPriceDisplay(definition.priceType, definition.priceValue)}
-                            </IndexTable.Cell>
+                            <IndexTable.Cell>{definition.price ? `$${definition.price.toFixed(2)}` : 'N/A'}</IndexTable.Cell>
                             <IndexTable.Cell>
                               {formatAssociationType(definition.associationType)}
                             </IndexTable.Cell>
                             <IndexTable.Cell>
                               <ButtonGroup>
-                                  <Button onClick={() => handleEdit(definition)} disabled={fetcher.state !== 'idle'}>Edit</Button>
+                                  <Button onClick={() => handleOpenEditModal(definition)} disabled={fetcher.state !== 'idle'}>Edit</Button>
                                   <Button
                                       variant="primary" tone="critical"
-                                      onClick={() => handleOpenDeleteModal(definition.id)}
+                                      onClick={() => handleOpenDeleteModal(String(definition.id))}
                                       disabled={fetcher.state !== 'idle'}
                                   >Delete</Button>
                               </ButtonGroup>
@@ -684,7 +1078,7 @@ export default function WarrantyDefinitionsPage() {
               ) : (
                 <EmptyState
                   heading="No warranty definitions yet"
-                  action={{ content: 'Create Definition', onAction: handleOpenModalForCreate }}
+                  action={{ content: 'Create Definition', onAction: handleOpenModal }}
                   image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
                 >
                   <p>Create your first warranty definition to offer extended warranties.</p>
@@ -710,23 +1104,218 @@ function formatAssociationType(type: WarrantyAssociationType | string): string {
     }
 }
 
-// Helper to format price type for display in Select
-function formatPriceType(type: PriceType | string): string {
-    switch (type) {
-        case PriceType.FIXED_AMOUNT: return 'Fixed Amount ($)';
-        case PriceType.PERCENTAGE: return 'Percentage (%)';
-        default: return typeof type === 'string' ? type.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) : 'Unknown';
+// --- Solución Alternativa cuando App Bridge falla ---
+function SimplePicker({
+  onSelect,
+  onCancel,
+  resourceType
+}: {
+  onSelect: (selection: any[]) => void,
+  onCancel: () => void,
+  resourceType: string
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [items, setItems] = useState<any[]>([]);
+  const [selectedItems, setSelectedItems] = useState<any[]>([]);
+  
+  // Usar fetcher para comunicarse con la action
+  const fetcher = useFetcher<any>();
+  
+  // Determinar el estado de carga
+  const isSearching = fetcher.state === 'submitting' || fetcher.state === 'loading';
+  
+  // Buscar productos/colecciones reales usando GraphQL
+  const searchItems = useCallback((query: string) => {
+    setIsLoading(true);
+    
+    const formData = new FormData();
+    formData.append("query", query);
+    formData.append("_action", resourceType === 'Product' ? 'search_products' : 'search_collections');
+    
+    // Enviar la acción directamente a nuestra ruta
+    fetcher.submit(formData, { method: "post" });
+  }, [fetcher, resourceType]);
+  
+  // Cargar los resultados cuando el fetcher devuelve datos
+  useEffect(() => {
+    if (fetcher.data) {
+      console.log("Datos recibidos:", fetcher.data);
+      
+      if (fetcher.data.status === 'success') {
+        // Set items from the results array in the response
+        setItems(fetcher.data.results || []);
+      } else {
+        console.error("Error en la búsqueda:", fetcher.data.message);
+        setItems([]);
+      }
+      
+      setIsLoading(false);
     }
-}
-
-// Helper to format price value for display in table
-function formatPriceDisplay(type: PriceType, value: number): string {
-    if (type === PriceType.FIXED_AMOUNT) {
-        // Assuming value is stored in cents
-        return `$${(value / 100).toFixed(2)}`;
-    } else if (type === PriceType.PERCENTAGE) {
-        // Assuming value is stored as percentage number (e.g., 10 for 10%)
-        return `${value}%`;
+  }, [fetcher.data]);
+  
+  // Efecto para buscar cuando cambia la consulta después de un pequeño retraso
+  useEffect(() => {
+    if (!isOpen) return;
+    
+    // Búsqueda inicial de elementos populares
+    if (isOpen && !items.length && !searchQuery && !isSearching) {
+      searchItems("");
+      return;
     }
-    return String(value); // Fallback
+    
+    const timer = setTimeout(() => {
+      if (searchQuery && searchQuery.length >= 2) {
+        searchItems(searchQuery);
+      }
+    }, 300);
+    
+    return () => clearTimeout(timer);
+  }, [isOpen, searchQuery, searchItems, items.length, isSearching]);
+  
+  const handleOpenPicker = () => {
+    setIsOpen(true);
+    setItems([]);
+    setSearchQuery("");
+    searchItems(""); // Realizar una búsqueda inicial vacía para mostrar productos populares
+  };
+  
+  const handleSelectItem = (item: any) => {
+    const isSelected = selectedItems.some(selected => selected.id === item.id);
+    
+    if (isSelected) {
+      setSelectedItems(selectedItems.filter(selected => selected.id !== item.id));
+    } else {
+      setSelectedItems([...selectedItems, item]);
+    }
+  };
+  
+  const handleConfirm = () => {
+    // Pasamos los items seleccionados al componente padre
+    onSelect(selectedItems);
+    setIsOpen(false);
+    setSelectedItems([]);
+  };
+  
+  const handleCancel = () => {
+    onCancel();
+    setIsOpen(false);
+    setSelectedItems([]);
+  };
+  
+  if (!isOpen) {
+    return (
+      <Button onClick={handleOpenPicker} variant="primary" size="slim">
+        {resourceType === 'Product' ? 'Seleccionar Productos' : 'Seleccionar Colecciones'}
+      </Button>
+    );
+  }
+  
+  return (
+    <Modal
+      open={isOpen}
+      onClose={handleCancel}
+      title={`Seleccionar ${resourceType === 'Product' ? 'Productos' : 'Colecciones'}`}
+      primaryAction={{
+        content: 'Confirmar Selección',
+        onAction: handleConfirm,
+        disabled: selectedItems.length === 0
+      }}
+      secondaryActions={[
+        {
+          content: 'Cancelar',
+          onAction: handleCancel
+        }
+      ]}
+    >
+      <Modal.Section>
+        <BlockStack gap="400">
+          <TextField
+            label="Buscar"
+            value={searchQuery}
+            onChange={setSearchQuery}
+            placeholder={`Buscar ${resourceType === 'Product' ? 'productos' : 'colecciones'}...`}
+            autoComplete="off"
+            helpText="Escribe al menos 2 caracteres para iniciar la búsqueda"
+          />
+          
+          {isLoading || isSearching ? (
+            <div style={{ padding: '20px', textAlign: 'center' }}>
+              <Spinner accessibilityLabel="Buscando..." size="large" />
+              <div style={{ marginTop: '10px' }}>Buscando...</div>
+            </div>
+          ) : (
+            <>
+              {items.length === 0 ? (
+                <Banner tone="info">
+                  <p>No se encontraron resultados. Intenta con otra búsqueda.</p>
+                </Banner>
+              ) : (
+                <div style={{ overflowY: 'auto', maxHeight: '400px' }}>
+                  <List type="bullet">
+                    {items.map((item) => {
+                      const isSelected = selectedItems.some(selected => selected.id === item.id);
+                      
+                      return (
+                        <List.Item key={item.id}>
+                          <Button 
+                            variant={isSelected ? "primary" : "plain"}
+                            onClick={() => handleSelectItem(item)}
+                            fullWidth
+                          >
+                            <InlineStack gap="200" blockAlign="center">
+                              {item.imageUrl && (
+                                <img 
+                                  src={item.imageUrl} 
+                                  alt={item.title} 
+                                  style={{ width: '40px', height: '40px', objectFit: 'cover' }} 
+                                />
+                              )}
+                              <BlockStack gap="100">
+                                <Text variant="bodyMd" as="span" fontWeight="bold">{item.title}</Text>
+                                <Text variant="bodySm" as="span" tone="subdued">{`ID: ${item.id}`}</Text>
+                              </BlockStack>
+                            </InlineStack>
+                          </Button>
+                        </List.Item>
+                      );
+                    })}
+                  </List>
+                </div>
+              )}
+            </>
+          )}
+          
+          {selectedItems.length > 0 && (
+            <div style={{ marginTop: '20px' }}>
+              <BlockStack gap="200">
+                <Text variant="headingMd" as="h3">Seleccionados ({selectedItems.length})</Text>
+                <div style={{ maxHeight: '150px', overflowY: 'auto' }}>
+                  {selectedItems.map(item => (
+                    <div key={item.id} style={{ 
+                      padding: '10px', 
+                      marginBottom: '8px', 
+                      border: '1px solid #ddd', 
+                      borderRadius: '8px' 
+                    }}>
+                      <InlineStack gap="100" align="space-between">
+                        <Text variant="bodyMd" as="span" fontWeight="bold">{item.title}</Text>
+                        <Button
+                          onClick={() => handleSelectItem(item)}
+                          variant="plain"
+                          icon={DeleteIcon}
+                        />
+                      </InlineStack>
+                      <Text variant="bodySm" as="span">{`ID: ${item.id}`}</Text>
+                    </div>
+                  ))}
+                </div>
+              </BlockStack>
+            </div>
+          )}
+        </BlockStack>
+      </Modal.Section>
+    </Modal>
+  );
 } 

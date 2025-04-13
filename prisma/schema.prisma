@@ -51,8 +51,7 @@ model WarrantyDefinition {
   id             Int      @id @default(autoincrement())
   name           String   // e.g., "12-Month Electronics Warranty"
   durationMonths Int      // e.g., 12, 24, 36
-  priceType      PriceType // Changed from String to Enum
-  priceValue     Float    // The percentage (e.g., 10.0) or fixed amount (e.g., 29.99)
+  price          Float    // The price of the warranty
   description    String?  // Optional description shown to admin/customer
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
@@ -64,6 +63,36 @@ model WarrantyDefinition {
 
   // Relation to associations
   productAssociations ProductAssociation[]
+  
+  // Relations for products and collections
+  products    Product[]
+  collections Collection[]
+}
+
+// Model for Product
+model Product {
+  id            Int      @id @default(autoincrement())
+  shopifyId     String   @unique
+  title         String
+  imageUrl      String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // Relation to warranty definitions
+  warrantyDefinitions WarrantyDefinition[]
+}
+
+// Model for Collection
+model Collection {
+  id            Int      @id @default(autoincrement())
+  shopifyId     String   @unique
+  title         String
+  imageUrl      String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // Relation to warranty definitions
+  warrantyDefinitions WarrantyDefinition[]
 }
 
 // Represents the actual product variant created in Shopify for a specific warranty offer
